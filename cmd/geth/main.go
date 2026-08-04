@@ -112,6 +112,8 @@ var (
 		utils.MinerGasPriceFlag,
 		utils.MinerExtraDataFlag,
 		utils.MinerMaxBlobsFlag,
+		utils.MinerDependencyAnalysisFlag,
+		utils.MinerDependencyDotDirFlag,
 		utils.MinerRecommitIntervalFlag,
 		utils.MinerPendingFeeRecipientFlag,
 		utils.NATFlag,

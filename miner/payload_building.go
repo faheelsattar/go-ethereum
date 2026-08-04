@@ -76,28 +76,32 @@ func (args *BuildPayloadArgs) Id() engine.PayloadID {
 // the revenue. Therefore, the empty-block here is always available and full-block
 // will be set/updated afterwards.
 type Payload struct {
-	id            engine.PayloadID
-	empty         *types.Block
-	emptyWitness  *stateless.Witness
-	full          *types.Block
-	fullWitness   *stateless.Witness
-	sidecars      []*types.BlobTxSidecar
-	emptyRequests [][]byte
-	requests      [][]byte
-	fullFees      *big.Int
-	stop          chan struct{}
-	lock          sync.Mutex
-	cond          *sync.Cond
+	id                engine.PayloadID
+	empty             *types.Block
+	emptyWitness      *stateless.Witness
+	emptyDependency   *dependencyAnalyzer
+	full              *types.Block
+	fullWitness       *stateless.Witness
+	fullDependency    *dependencyAnalyzer
+	dependencyWritten bool
+	sidecars          []*types.BlobTxSidecar
+	emptyRequests     [][]byte
+	requests          [][]byte
+	fullFees          *big.Int
+	stop              chan struct{}
+	lock              sync.Mutex
+	cond              *sync.Cond
 }
 
 // newPayload initializes the payload object.
-func newPayload(empty *types.Block, emptyRequests [][]byte, witness *stateless.Witness, id engine.PayloadID) *Payload {
+func newPayload(empty *types.Block, emptyRequests [][]byte, witness *stateless.Witness, dependency *dependencyAnalyzer, id engine.PayloadID) *Payload {
 	payload := &Payload{
-		id:            id,
-		empty:         empty,
-		emptyRequests: emptyRequests,
-		emptyWitness:  witness,
-		stop:          make(chan struct{}),
+		id:              id,
+		empty:           empty,
+		emptyRequests:   emptyRequests,
+		emptyWitness:    witness,
+		emptyDependency: dependency,
+		stop:            make(chan struct{}),
 	}
 	log.Info("Starting work on payload", "id", payload.id)
 	payload.cond = sync.NewCond(&payload.lock)
@@ -124,6 +128,7 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 		payload.sidecars = r.sidecars
 		payload.requests = r.requests
 		payload.fullWitness = r.witness
+		payload.fullDependency = r.dependency
 
 		feesInEther := new(big.Float).Quo(new(big.Float).SetInt(r.fees), big.NewFloat(params.Ether))
 		log.Info("Updated payload",
@@ -154,6 +159,7 @@ func (payload *Payload) Resolve() *engine.ExecutionPayloadEnvelope {
 	default:
 		close(payload.stop)
 	}
+	payload.writeDependencyDOT()
 	if payload.full != nil {
 		envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 		if payload.fullWitness != nil {
@@ -207,12 +213,42 @@ func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 	default:
 		close(payload.stop)
 	}
+	payload.writeDependencyDOT()
 	envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 	if payload.fullWitness != nil {
 		envelope.Witness = new(hexutil.Bytes)
 		*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 	}
 	return envelope
+}
+
+// writeDependencyDOT writes the graph for the payload selected for delivery.
+// The caller must hold payload.lock.
+func (payload *Payload) writeDependencyDOT() {
+	if payload.dependencyWritten {
+		return
+	}
+	dependency := payload.emptyDependency
+	if payload.full != nil {
+		dependency = payload.fullDependency
+	}
+	if dependency == nil || dependency.dotDir == "" {
+		return
+	}
+	path, err := dependency.writeDOT(analyzeDependencies(dependency.transactions))
+	if err != nil {
+		log.Warn("Failed to write delivered payload dependency graph", "id", payload.id, "build", dependency.buildID, "err", err)
+		return
+	}
+	payload.dependencyWritten = true
+	payload.emptyDependency = nil
+	payload.fullDependency = nil
+	log.Info("Wrote delivered payload dependency graph",
+		"id", payload.id,
+		"build", dependency.buildID,
+		"number", dependency.blockNumber,
+		"file", path,
+	)
 }
 
 func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iteration int, payload *Payload, params *generateParams, witness bool) {
@@ -261,7 +297,7 @@ func (miner *Miner) buildPayload(ctx context.Context, args *BuildPayloadArgs, wi
 		return nil, empty.err
 	}
 	// Construct a payload object for return.
-	payload := newPayload(empty.block, empty.requests, empty.witness, payloadID)
+	payload := newPayload(empty.block, empty.requests, empty.witness, empty.dependency, payloadID)
 
 	// Spin up a routine for updating the payload in background. This strategy
 	// can maximum the revenue for including transactions with highest fee.

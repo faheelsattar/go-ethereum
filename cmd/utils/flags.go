@@ -607,6 +607,16 @@ var (
 		Usage:    "Maximum number of blobs per block (falls back to protocol maximum if unspecified)",
 		Category: flags.MinerCategory,
 	}
+	MinerDependencyAnalysisFlag = &cli.BoolFlag{
+		Name:     "miner.dependency-analysis",
+		Usage:    "Log transaction storage accesses and dependency metrics during block construction",
+		Category: flags.MinerCategory,
+	}
+	MinerDependencyDotDirFlag = &cli.PathFlag{
+		Name:     "miner.dependency-dotdir",
+		Usage:    "Directory for delivered payload transaction dependency graph DOT files (enables dependency analysis)",
+		Category: flags.MinerCategory,
+	}
 
 	// Account settings
 	PasswordFileFlag = &cli.PathFlag{
@@ -1722,6 +1732,15 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(MinerMaxBlobsFlag.Name) {
 		cfg.MaxBlobsPerBlock = ctx.Int(MinerMaxBlobsFlag.Name)
+	}
+	if ctx.IsSet(MinerDependencyAnalysisFlag.Name) {
+		cfg.DependencyAnalysis = ctx.Bool(MinerDependencyAnalysisFlag.Name)
+	}
+	if ctx.IsSet(MinerDependencyDotDirFlag.Name) {
+		cfg.DependencyDotDir = ctx.Path(MinerDependencyDotDirFlag.Name)
+		if cfg.DependencyDotDir != "" {
+			cfg.DependencyAnalysis = true
+		}
 	}
 }
 

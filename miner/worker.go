@@ -76,6 +76,9 @@ type environment struct {
 	bal      *bal.ConstructionBlockAccessList
 
 	witness *stateless.Witness
+
+	dependency    *dependencyAnalyzer
+	candidateRank uint64
 }
 
 // txFitsSize reports whether the transaction fits into the block size limit.
@@ -105,14 +108,15 @@ const maxBlockSizeBufferZone = 1_000_000
 
 // newPayloadResult is the result of payload generation.
 type newPayloadResult struct {
-	err      error
-	block    *types.Block
-	fees     *big.Int               // total block fees
-	sidecars []*types.BlobTxSidecar // collected blobs of blob transactions
-	stateDB  *state.StateDB         // StateDB after executing the transactions
-	receipts []*types.Receipt       // Receipts collected during construction
-	requests [][]byte               // Consensus layer requests collected during block construction
-	witness  *stateless.Witness     // Witness is an optional stateless proof
+	err        error
+	block      *types.Block
+	fees       *big.Int               // total block fees
+	sidecars   []*types.BlobTxSidecar // collected blobs of blob transactions
+	stateDB    *state.StateDB         // StateDB after executing the transactions
+	receipts   []*types.Receipt       // Receipts collected during construction
+	requests   [][]byte               // Consensus layer requests collected during block construction
+	witness    *stateless.Witness     // Witness is an optional stateless proof
+	dependency *dependencyAnalyzer
 }
 
 // generateParams wraps various settings for generating sealing task.
@@ -154,6 +158,9 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 		return &newPayloadResult{err: err}
 	}
 	defer work.discard()
+	if work.dependency != nil {
+		defer work.dependency.logSummary()
+	}
 
 	// Check withdrawals fit max block size.
 	// Due to the cap on withdrawal count, this can actually never happen, but we still need to
@@ -170,6 +177,9 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 		// otherwise, fill the block with the current transactions from the txpool
 		if genParam.forceOverrides && len(genParam.overrideTxs) > 0 {
 			for _, tx := range genParam.overrideTxs {
+				if work.dependency != nil {
+					work.candidateRank = work.dependency.nextCandidate()
+				}
 				work.state.SetTxContext(tx.Hash(), work.tcount, uint32(work.tcount+1))
 				if err := miner.commitTransaction(ctx, work, tx); err != nil {
 					// all passed transactions HAVE to be valid at this point
@@ -229,14 +239,24 @@ func (miner *Miner) generateWork(ctx context.Context, genParam *generateParams, 
 	block := core.AssembleBlock(miner.chain, work.header, work.state, &body, work.receipts, work.bal)
 	assembleSpanEnd(nil)
 
+	dependency := work.dependency
+	if dependency != nil {
+		// State is only needed while tracing execution. Avoid retaining the
+		// completed build state until the payload is delivered.
+		dependency.state = nil
+		if dependency.dotDir == "" {
+			dependency = nil
+		}
+	}
 	return &newPayloadResult{
-		block:    block,
-		fees:     totalFees(block, work.receipts),
-		sidecars: work.sidecars,
-		stateDB:  work.state,
-		receipts: work.receipts,
-		requests: requests,
-		witness:  work.witness,
+		block:      block,
+		fees:       totalFees(block, work.receipts),
+		sidecars:   work.sidecars,
+		stateDB:    work.state,
+		receipts:   work.receipts,
+		requests:   requests,
+		witness:    work.witness,
+		dependency: dependency,
 	}
 }
 
@@ -346,17 +366,26 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	}
 	state.StartPrefetcher("miner", bundle)
 
+	var (
+		dependency *dependencyAnalyzer
+		vmConfig   vm.Config
+	)
+	if miner.config.DependencyAnalysis || miner.config.DependencyDotDir != "" {
+		dependency = newDependencyAnalyzer(dependencyBuildCounter.Add(1), header, state, miner.config.DependencyDotDir)
+		vmConfig.Tracer = dependency.hooks()
+	}
 	// Note the passed coinbase may be different with header.Coinbase.
 	return &environment{
-		signer:   types.MakeSigner(miner.chainConfig, header.Number, header.Time),
-		state:    state,
-		size:     uint64(header.Size()),
-		coinbase: coinbase,
-		gasPool:  core.NewGasPool(header.GasLimit),
-		header:   header,
-		bal:      bal.NewConstructionBlockAccessList(),
-		witness:  state.Witness(),
-		evm:      vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &coinbase), state, miner.chainConfig, vm.Config{}),
+		signer:     types.MakeSigner(miner.chainConfig, header.Number, header.Time),
+		state:      state,
+		size:       uint64(header.Size()),
+		coinbase:   coinbase,
+		gasPool:    core.NewGasPool(header.GasLimit),
+		header:     header,
+		bal:        bal.NewConstructionBlockAccessList(),
+		witness:    state.Witness(),
+		evm:        vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &coinbase), state, miner.chainConfig, vmConfig),
+		dependency: dependency,
 	}, nil
 }
 
@@ -413,11 +442,22 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 		snap = env.state.Snapshot()
 		gp   = env.gasPool.Snapshot()
 	)
+	start := time.Now()
+	if env.dependency != nil {
+		from, _ := types.Sender(env.signer, tx)
+		env.dependency.beginTransaction(tx, from, env.tcount, env.candidateRank)
+	}
 	receipt, bal, err := core.ApplyTransaction(env.evm, env.gasPool, env.state, env.header, tx)
 	if err != nil {
+		if env.dependency != nil {
+			env.dependency.abortTransaction()
+		}
 		env.state.RevertToSnapshot(snap)
 		env.gasPool.Set(gp)
 		return nil, nil, err
+	}
+	if env.dependency != nil {
+		env.dependency.finishTransaction(receipt, time.Since(start))
 	}
 	env.header.GasUsed = env.gasPool.Used()
 	return receipt, bal, nil
@@ -470,9 +510,15 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		if ltx == nil {
 			break
 		}
+		if env.dependency != nil {
+			env.candidateRank = env.dependency.nextCandidate()
+		}
 		// If we don't have enough space for the next transaction, skip the account.
 		if env.gasPool.Gas() < ltx.Gas {
 			log.Trace("Not enough gas left for transaction", "hash", ltx.Hash, "left", env.gasPool.Gas(), "needed", ltx.Gas)
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, ltx.Hash, "skipped", "gas-limit", nil)
+			}
 			txs.Pop()
 			continue
 		}
@@ -484,6 +530,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			left := miner.maxBlobsPerBlock(env.header.Time) - env.blobs
 			if left < int(ltx.BlobGas/params.BlobTxBlobGasPerBlob) {
 				log.Trace("Not enough blob space left for transaction", "hash", ltx.Hash, "left", left, "needed", ltx.BlobGas/params.BlobTxBlobGasPerBlob)
+				if env.dependency != nil {
+					env.dependency.logCandidate(env.candidateRank, ltx.Hash, "skipped", "blob-gas-limit", nil)
+				}
 				txs.Pop()
 				continue
 			}
@@ -493,6 +542,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		tx := ltx.Resolve()
 		if tx == nil {
 			log.Trace("Ignoring evicted transaction", "hash", ltx.Hash)
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, ltx.Hash, "skipped", "evicted", nil)
+			}
 			txs.Pop()
 			continue
 		}
@@ -500,6 +552,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		// if inclusion of the transaction would put the block size over the
 		// maximum we allow, don't add any more txs to the payload.
 		if !env.txFitsSize(tx) {
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, tx.Hash(), "skipped", "block-size", nil)
+			}
 			break
 		}
 		// Error may be ignored here. The error has already been checked
@@ -510,6 +565,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		// phase, start ignoring the sender until we do.
 		if tx.Protected() && !miner.chainConfig.IsEIP155(env.header.Number) {
 			log.Trace("Ignoring replay protected transaction", "hash", ltx.Hash, "eip155", miner.chainConfig.EIP155Block)
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, tx.Hash(), "skipped", "replay-protected", nil)
+			}
 			txs.Pop()
 			continue
 		}
@@ -521,6 +579,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 		case errors.Is(err, core.ErrNonceTooLow):
 			// New head notification data race between the transaction pool and miner, shift
 			log.Trace("Skipping transaction with low nonce", "hash", ltx.Hash, "sender", from, "nonce", tx.Nonce())
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, tx.Hash(), "skipped", "nonce-too-low", err)
+			}
 			txs.Shift()
 
 		case errors.Is(err, nil):
@@ -531,6 +592,9 @@ func (miner *Miner) commitTransactions(ctx context.Context, env *environment, pl
 			// Transaction is regarded as invalid, drop all consecutive transactions from
 			// the same sender because of `nonce-too-high` clause.
 			log.Debug("Transaction failed, account skipped", "hash", ltx.Hash, "err", err)
+			if env.dependency != nil {
+				env.dependency.logCandidate(env.candidateRank, tx.Hash(), "skipped", "execution", err)
+			}
 			txs.Pop()
 		}
 	}
@@ -572,6 +636,9 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 		filter.BlobVersion = types.BlobSidecarVersion0
 	}
 	pendingBlobTxs, blobTxCount := miner.txpool.Pending(filter)
+	if env.dependency != nil {
+		env.dependency.setPendingCounts(plainTxCount, blobTxCount)
+	}
 	span.SetAttributes(
 		telemetry.IntAttribute("pending.plain.count", plainTxCount),
 		telemetry.IntAttribute("pending.blob.count", blobTxCount),
