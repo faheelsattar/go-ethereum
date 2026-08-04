@@ -50,6 +50,8 @@ type Config struct {
 	GasPrice            *big.Int       // Minimum gas price for mining a transaction
 	Recommit            time.Duration  // The time interval for miner to re-create mining work.
 	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
+	DependencyAnalysis  bool           // Log transaction storage access and dependency metrics during block construction.
+	DependencyDotDir    string         // Directory for transaction dependency graph DOT files.
 }
 
 // DefaultConfig contains default settings for miner.
