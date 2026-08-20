@@ -64,6 +64,7 @@ type dependencyAnalyzer struct {
 	pendingBlobTxs  int
 	summaryLogged   bool
 	dotDir          string
+	silent          bool
 }
 
 type dependencyPair struct {
@@ -209,6 +210,12 @@ func (a *dependencyAnalyzer) finishTransaction(receipt *types.Receipt, elapsed t
 	tx.status = receipt.Status
 	a.transactions = append(a.transactions, tx)
 
+	if !a.silent {
+		a.logTransaction(tx)
+	}
+}
+
+func (a *dependencyAnalyzer) logTransaction(tx *transactionAccess) {
 	log.Info("Block build transaction access",
 		"build", a.buildID,
 		"parent", a.parentHash,
@@ -234,6 +241,16 @@ func (a *dependencyAnalyzer) finishTransaction(receipt *types.Receipt, elapsed t
 		"changedWriteAttempts", tx.changedWriteCount,
 		"phantomWrites", tx.phantomWriteCount,
 	)
+}
+
+func (a *dependencyAnalyzer) commitParallelTransaction(tx *transactionAccess, index int, candidateRank uint64) {
+	if tx == nil {
+		return
+	}
+	tx.index = index
+	tx.candidateRank = candidateRank
+	a.transactions = append(a.transactions, tx)
+	a.logTransaction(tx)
 }
 
 func (a *dependencyAnalyzer) abortTransaction() {

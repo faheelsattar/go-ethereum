@@ -164,3 +164,18 @@ func (t *TransactionsByPriceAndNonce) Empty() bool {
 func (t *TransactionsByPriceAndNonce) Clear() {
 	t.heads, t.txs = nil, nil
 }
+
+// Copy creates an independent copy of the transaction ordering. The lazy
+// transactions themselves are immutable and are therefore shared.
+func (t *TransactionsByPriceAndNonce) Copy() *TransactionsByPriceAndNonce {
+	txs := make(map[common.Address][]*txpool.LazyTransaction, len(t.txs))
+	for addr, transactions := range t.txs {
+		txs[addr] = append([]*txpool.LazyTransaction(nil), transactions...)
+	}
+	return &TransactionsByPriceAndNonce{
+		txs:     txs,
+		heads:   append(txByPriceAndTime(nil), t.heads...),
+		signer:  t.signer,
+		baseFee: t.baseFee,
+	}
+}

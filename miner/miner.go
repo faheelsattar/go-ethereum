@@ -52,12 +52,18 @@ type Config struct {
 	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
 	DependencyAnalysis  bool           // Log transaction storage access and dependency metrics during block construction.
 	DependencyDotDir    string         // Directory for transaction dependency graph DOT files.
+	ParallelExecution   bool           // Execute transactions optimistically with a shared worker pool.
+	ParallelWorkers     int            // Maximum optimistic execution workers.
+	ParallelRetries     int            // Maximum conflict retries before sequential fallback.
 }
 
 // DefaultConfig contains default settings for miner.
 var DefaultConfig = Config{
 	GasCeil:  60_000_000,
 	GasPrice: big.NewInt(params.GWei / 1000),
+
+	ParallelWorkers: 8,
+	ParallelRetries: 1,
 
 	// The default recommit time is chosen as two seconds since
 	// consensus-layer usually will wait a half slot of time(6s)
