@@ -617,6 +617,23 @@ var (
 		Usage:    "Directory for delivered payload transaction dependency graph DOT files (enables dependency analysis)",
 		Category: flags.MinerCategory,
 	}
+	MinerParallelExecutionFlag = &cli.BoolFlag{
+		Name:     "miner.parallel-execution",
+		Usage:    "Execute transactions optimistically with a shared worker pool during block construction",
+		Category: flags.MinerCategory,
+	}
+	MinerParallelWorkersFlag = &cli.UintFlag{
+		Name:     "miner.parallel-workers",
+		Usage:    "Maximum optimistic transaction execution workers (capped by GOMAXPROCS)",
+		Value:    uint(ethconfig.Defaults.Miner.ParallelWorkers),
+		Category: flags.MinerCategory,
+	}
+	MinerParallelRetriesFlag = &cli.UintFlag{
+		Name:     "miner.parallel-retries",
+		Usage:    "Maximum optimistic conflict retries before sequential fallback",
+		Value:    uint(ethconfig.Defaults.Miner.ParallelRetries),
+		Category: flags.MinerCategory,
+	}
 
 	// Account settings
 	PasswordFileFlag = &cli.PathFlag{
@@ -1741,6 +1758,15 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 		if cfg.DependencyDotDir != "" {
 			cfg.DependencyAnalysis = true
 		}
+	}
+	if ctx.IsSet(MinerParallelExecutionFlag.Name) {
+		cfg.ParallelExecution = ctx.Bool(MinerParallelExecutionFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelWorkersFlag.Name) {
+		cfg.ParallelWorkers = int(ctx.Uint(MinerParallelWorkersFlag.Name))
+	}
+	if ctx.IsSet(MinerParallelRetriesFlag.Name) {
+		cfg.ParallelRetries = int(ctx.Uint(MinerParallelRetriesFlag.Name))
 	}
 }
 

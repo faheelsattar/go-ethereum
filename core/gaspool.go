@@ -33,6 +33,16 @@ type GasPool struct {
 	cumulativeState   uint64
 }
 
+// GasPoolDelta contains the gas consumed by one transaction relative to the
+// gas-pool state on which it was speculatively executed.
+type GasPoolDelta struct {
+	legacyUsed uint64
+	regular    uint64
+	state      uint64
+	receipt    uint64
+	amsterdam  bool
+}
+
 // NewGasPool initializes the gasPool with the given amount.
 func NewGasPool(amount uint64) *GasPool {
 	return &GasPool{
@@ -131,6 +141,47 @@ func (gp *GasPool) Snapshot() *GasPool {
 		cumulativeRegular: gp.cumulativeRegular,
 		cumulativeState:   gp.cumulativeState,
 	}
+}
+
+// TransactionDelta returns the contribution made to gp since base.
+func (gp *GasPool) TransactionDelta(base *GasPool) (GasPoolDelta, error) {
+	if gp.initial != base.initial || gp.cumulativeUsed < base.cumulativeUsed || gp.cumulativeRegular < base.cumulativeRegular || gp.cumulativeState < base.cumulativeState {
+		return GasPoolDelta{}, fmt.Errorf("invalid speculative gas-pool delta")
+	}
+	delta := GasPoolDelta{
+		regular:   gp.cumulativeRegular - base.cumulativeRegular,
+		state:     gp.cumulativeState - base.cumulativeState,
+		receipt:   gp.cumulativeUsed - base.cumulativeUsed,
+		amsterdam: gp.cumulativeRegular > 0 || gp.cumulativeState > 0,
+	}
+	if !delta.amsterdam {
+		if gp.remaining > base.remaining {
+			return GasPoolDelta{}, fmt.Errorf("invalid speculative legacy gas-pool delta")
+		}
+		delta.legacyUsed = base.remaining - gp.remaining
+	}
+	return delta, nil
+}
+
+// ApplyTransactionDelta charges a speculative transaction's gas contribution
+// to gp in canonical block order.
+func (gp *GasPool) ApplyTransactionDelta(delta GasPoolDelta) error {
+	if delta.amsterdam {
+		if delta.regular > gp.initial-gp.cumulativeRegular || delta.state > gp.initial-gp.cumulativeState {
+			return ErrGasLimitReached
+		}
+		gp.cumulativeRegular += delta.regular
+		gp.cumulativeState += delta.state
+		gp.cumulativeUsed += delta.receipt
+		gp.remaining = gp.initial - gp.cumulativeRegular
+		return nil
+	}
+	if delta.legacyUsed > gp.remaining {
+		return ErrGasLimitReached
+	}
+	gp.remaining -= delta.legacyUsed
+	gp.cumulativeUsed += delta.receipt
+	return nil
 }
 
 // Set sets the content of gasPool with the provided one.

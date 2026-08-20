@@ -131,6 +131,9 @@ type StateDB struct {
 	// Per-transaction state access footprint for EIP-7928
 	stateAccessList *bal.ConstructionBlockAccessList
 
+	// Optional transaction-local recorder used by optimistic block building.
+	parallelRecorder *parallelStateRecorder
+
 	// Block access index (0 for pre-execution, 1..n for transactions, n+1 for post-execution)
 	blockAccessIndex uint32
 
@@ -315,23 +318,27 @@ func (s *StateDB) SubRefund(gas uint64) {
 // Exist reports whether the given account address exists in the state.
 // Notably this also returns true for self-destructed accounts within the current transaction.
 func (s *StateDB) Exist(addr common.Address) bool {
+	s.recordAccountRead(addr, ParallelAccountExistence)
 	return s.getStateObject(addr) != nil
 }
 
 // Empty returns whether the state object is either non-existent
 // or empty according to the EIP161 specification (balance = nonce = code = 0)
 func (s *StateDB) Empty(addr common.Address) bool {
+	s.recordAccountRead(addr, parallelAccountAll)
 	so := s.getStateObject(addr)
 	return so == nil || so.empty()
 }
 
 // Touch accesses the specific account without returning anything.
 func (s *StateDB) Touch(addr common.Address) {
+	s.recordAccountRead(addr, ParallelAccountExistence)
 	s.getStateObject(addr)
 }
 
 // GetBalance retrieves the balance from the given address or 0 if object not found
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
+	s.recordAccountRead(addr, ParallelAccountBalance)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Balance()
@@ -341,6 +348,7 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 
 // GetNonce retrieves the nonce from the given address or 0 if object not found
 func (s *StateDB) GetNonce(addr common.Address) uint64 {
+	s.recordAccountRead(addr, ParallelAccountNonce)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Nonce()
@@ -368,6 +376,7 @@ func (s *StateDB) TxIndex() int {
 }
 
 func (s *StateDB) GetCode(addr common.Address) []byte {
+	s.recordAccountRead(addr, ParallelAccountCode)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		if s.witness != nil {
@@ -379,6 +388,7 @@ func (s *StateDB) GetCode(addr common.Address) []byte {
 }
 
 func (s *StateDB) GetCodeSize(addr common.Address) int {
+	s.recordAccountRead(addr, ParallelAccountCode)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		if s.witness != nil {
@@ -390,6 +400,7 @@ func (s *StateDB) GetCodeSize(addr common.Address) int {
 }
 
 func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
+	s.recordAccountRead(addr, ParallelAccountCode)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return common.BytesToHash(stateObject.CodeHash())
@@ -399,6 +410,7 @@ func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
 
 // GetState retrieves the value associated with the specific key.
 func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
+	s.recordStorageRead(addr, hash)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.GetState(hash)
@@ -409,6 +421,7 @@ func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
 // GetCommittedState retrieves the value associated with the specific key
 // without any mutations caused in the current execution.
 func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) common.Hash {
+	s.recordStorageRead(addr, hash)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.GetCommittedState(hash)
@@ -418,6 +431,7 @@ func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) commo
 
 // GetStateAndCommittedState returns the current value and the original value.
 func (s *StateDB) GetStateAndCommittedState(addr common.Address, hash common.Hash) (common.Hash, common.Hash) {
+	s.recordStorageRead(addr, hash)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.getState(hash)
@@ -450,6 +464,7 @@ func (s *StateDB) HasSelfDestructed(addr common.Address) bool {
 
 // AddBalance adds amount to the account associated with addr.
 func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	s.recordBalanceWrite(addr, amount, reason)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject == nil {
 		return uint256.Int{}
@@ -459,6 +474,7 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 
 // SubBalance subtracts amount from the account associated with addr.
 func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) uint256.Int {
+	s.recordBalanceWrite(addr, amount, reason)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject == nil {
 		return uint256.Int{}
@@ -470,6 +486,8 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 }
 
 func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
+	s.recordAccountRead(addr, ParallelAccountBalance)
+	s.recordAccountWrite(addr, ParallelAccountBalance)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		stateObject.SetBalance(amount)
@@ -477,6 +495,8 @@ func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tr
 }
 
 func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.NonceChangeReason) {
+	s.recordAccountRead(addr, ParallelAccountNonce)
+	s.recordAccountWrite(addr, ParallelAccountNonce)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		stateObject.SetNonce(nonce)
@@ -484,6 +504,8 @@ func (s *StateDB) SetNonce(addr common.Address, nonce uint64, reason tracing.Non
 }
 
 func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeChangeReason) (prev []byte) {
+	s.recordAccountRead(addr, ParallelAccountCode)
+	s.recordAccountWrite(addr, ParallelAccountCode)
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
 		return stateObject.SetCode(crypto.Keccak256Hash(code), code)
@@ -492,6 +514,7 @@ func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeC
 }
 
 func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
+	s.recordStorageWrite(addr, key)
 	if stateObject := s.getOrNewStateObject(addr); stateObject != nil {
 		return stateObject.SetState(key, value)
 	}
@@ -532,6 +555,8 @@ func (s *StateDB) SetStorage(addr common.Address, storage map[common.Hash]common
 // The account's state object is still available until the state is committed,
 // getStateObject will return a non-nil account after SelfDestruct.
 func (s *StateDB) SelfDestruct(addr common.Address) {
+	s.recordAccountRead(addr, parallelAccountAll)
+	s.recordAccountWrite(addr, parallelAccountAll)
 	stateObject := s.getStateObject(addr)
 	if stateObject == nil {
 		return
@@ -658,6 +683,8 @@ func (s *StateDB) createObject(addr common.Address) *stateObject {
 // exists, this function will silently overwrite it which might lead to a
 // consensus bug eventually.
 func (s *StateDB) CreateAccount(addr common.Address) {
+	s.recordAccountRead(addr, ParallelAccountExistence)
+	s.recordAccountWrite(addr, parallelAccountAll)
 	s.createObject(addr)
 }
 
@@ -667,6 +694,8 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 // This operation sets the 'newContract'-flag, which is required in order to
 // correctly handle EIP-6780 'delete-in-same-transaction' logic.
 func (s *StateDB) CreateContract(addr common.Address) {
+	s.recordAccountRead(addr, ParallelAccountExistence)
+	s.recordAccountWrite(addr, parallelAccountAll)
 	obj := s.getStateObject(addr)
 	if !obj.newContract {
 		obj.newContract = true
@@ -769,6 +798,9 @@ func (s *StateDB) GetRefund() uint64 {
 // the journal as well as the refunds. Finalise, however, will not push any updates
 // into the tries just yet. Only IntermediateRoot or Commit will do that.
 func (s *StateDB) Finalise(deleteEmptyObjects bool) *bal.ConstructionBlockAccessList {
+	if s.parallelRecorder != nil {
+		s.parallelRecorder.capture(s)
+	}
 	if s.stateAccessList != nil {
 		return s.finaliseAmsterdam(deleteEmptyObjects)
 	}

@@ -464,6 +464,17 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 }
 
 func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
+	if miner.config.ParallelExecution {
+		if supported, reason := parallelExecutionSupported(env); supported {
+			return miner.commitTransactionsParallel(ctx, env, plainTxs, blobTxs, interrupt)
+		} else {
+			log.Debug("Falling back to sequential block execution", "reason", reason)
+		}
+	}
+	return miner.commitTransactionsSequential(ctx, env, plainTxs, blobTxs, interrupt)
+}
+
+func (miner *Miner) commitTransactionsSequential(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
 	ctx, _, spanEnd := telemetry.StartSpan(ctx, "miner.commitTransactions")
 	defer spanEnd(nil)
 
