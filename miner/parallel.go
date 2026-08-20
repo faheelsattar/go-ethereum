@@ -11,8 +11,10 @@ package miner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -90,6 +92,29 @@ type parallelBuildMetrics struct {
 	retryTime        time.Duration
 	committed        int
 	sequentialErrors int
+	directConflicts  int
+	senderChainStale int
+	storageConflicts int
+	balanceConflicts int
+	nonceConflicts   int
+	codeConflicts    int
+	existConflicts   int
+	incomplete       int
+	conflictHotspots map[parallelConflictLocation]int
+}
+
+type parallelConflictLocation struct {
+	kind    state.ParallelConflictKind
+	address common.Address
+	slot    common.Hash
+	fields  state.ParallelAccountFields
+}
+
+type parallelConflict struct {
+	previousHash     common.Hash
+	previousPosition int
+	state            *state.ParallelStateConflict
+	incomplete       bool
 }
 
 func parallelDependencyBuildID(dependency *dependencyAnalyzer) uint64 {
@@ -336,21 +361,138 @@ func (miner *Miner) retryParallelTask(env *environment, task *parallelTask) *par
 	return retry.result
 }
 
-func parallelResultConflicts(task *parallelTask, prior []parallelCommittedResult) bool {
+func parallelResultConflict(task *parallelTask, prior []parallelCommittedResult) *parallelConflict {
 	if task.result == nil || task.result.state == nil {
-		return true
+		return &parallelConflict{incomplete: true}
 	}
 	for _, committed := range prior {
-		if committed.sender != task.sender && task.result.state.Conflicts(committed.state) {
-			return true
+		if committed.sender == task.sender {
+			continue
+		}
+		if conflict := task.result.state.Conflict(committed.state); conflict != nil {
+			return &parallelConflict{
+				previousHash:     committed.hash,
+				previousPosition: committed.position,
+				state:            conflict,
+			}
 		}
 	}
-	return false
+	return nil
 }
 
 type parallelCommittedResult struct {
-	sender common.Address
-	state  *state.ParallelStateResult
+	hash     common.Hash
+	position int
+	sender   common.Address
+	state    *state.ParallelStateResult
+}
+
+func parallelAccountFieldsLabel(fields state.ParallelAccountFields) string {
+	var labels []string
+	if fields&state.ParallelAccountExistence != 0 {
+		labels = append(labels, "existence")
+	}
+	if fields&state.ParallelAccountBalance != 0 {
+		labels = append(labels, "balance")
+	}
+	if fields&state.ParallelAccountNonce != 0 {
+		labels = append(labels, "nonce")
+	}
+	if fields&state.ParallelAccountCode != 0 {
+		labels = append(labels, "code")
+	}
+	return strings.Join(labels, ",")
+}
+
+func (metrics *parallelBuildMetrics) recordDirectConflict(conflict *parallelConflict) {
+	metrics.directConflicts++
+	if conflict.incomplete || conflict.state == nil {
+		metrics.incomplete++
+		return
+	}
+	location := parallelConflictLocation{
+		kind:    conflict.state.Kind,
+		address: conflict.state.Address,
+		slot:    conflict.state.Slot,
+		fields:  conflict.state.AccountFields,
+	}
+	if metrics.conflictHotspots == nil {
+		metrics.conflictHotspots = make(map[parallelConflictLocation]int)
+	}
+	metrics.conflictHotspots[location]++
+	if conflict.state.Kind == state.ParallelStorageConflict {
+		metrics.storageConflicts++
+		return
+	}
+	if conflict.state.AccountFields&state.ParallelAccountExistence != 0 {
+		metrics.existConflicts++
+	}
+	if conflict.state.AccountFields&state.ParallelAccountBalance != 0 {
+		metrics.balanceConflicts++
+	}
+	if conflict.state.AccountFields&state.ParallelAccountNonce != 0 {
+		metrics.nonceConflicts++
+	}
+	if conflict.state.AccountFields&state.ParallelAccountCode != 0 {
+		metrics.codeConflicts++
+	}
+}
+
+func logParallelConflict(task *parallelTask, index int, conflict *parallelConflict) {
+	ctx := []any{
+		"hash", task.tx.Hash(),
+		"sender", task.sender,
+		"position", task.position,
+		"index", index,
+	}
+	if conflict.incomplete || conflict.state == nil {
+		log.Debug("Retrying optimistic transaction after incomplete speculative result", ctx...)
+		return
+	}
+	ctx = append(ctx,
+		"conflictsWith", conflict.previousHash,
+		"conflictsWithPosition", conflict.previousPosition,
+		"address", conflict.state.Address,
+	)
+	if conflict.state.Kind == state.ParallelStorageConflict {
+		ctx = append(ctx, "reason", "storage-read-after-write", "slot", conflict.state.Slot)
+	} else if conflict.state.AccountFields&state.ParallelAccountExistence != 0 {
+		ctx = append(ctx, "reason", "account-existence-change", "accountFields", parallelAccountFieldsLabel(conflict.state.AccountFields))
+	} else {
+		ctx = append(ctx, "reason", "account-read-after-write", "accountFields", parallelAccountFieldsLabel(conflict.state.AccountFields))
+	}
+	log.Debug("Retrying optimistic transaction after stale state read", ctx...)
+}
+
+func topParallelConflictLocations(locations map[parallelConflictLocation]int, limit int) []string {
+	type hotspot struct {
+		count int
+		label string
+	}
+	hotspots := make([]hotspot, 0, len(locations))
+	for location, count := range locations {
+		var label string
+		if location.kind == state.ParallelStorageConflict {
+			label = fmt.Sprintf("storage:%s:%s", location.address, location.slot)
+		} else {
+			label = fmt.Sprintf("account:%s:%s", location.address, parallelAccountFieldsLabel(location.fields))
+		}
+		hotspots = append(hotspots, hotspot{count: count, label: label})
+	}
+	sort.Slice(hotspots, func(i, j int) bool {
+		if hotspots[i].count != hotspots[j].count {
+			return hotspots[i].count > hotspots[j].count
+		}
+		return hotspots[i].label < hotspots[j].label
+	})
+	if len(hotspots) > limit {
+		hotspots = hotspots[:limit]
+	}
+	result := make([]string, len(hotspots))
+	for i, hotspot := range hotspots {
+		result[i] = fmt.Sprintf("%s=%d", hotspot.label, hotspot.count)
+	}
+	return result
 }
 
 func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTask, candidateRank uint64) error {
@@ -417,6 +559,15 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			"firstAttemptCommits", metrics.firstAttempt,
 			"retriedCommits", metrics.retriedCommitted,
 			"conflicts", metrics.conflicts,
+			"directConflicts", metrics.directConflicts,
+			"senderChainInvalidations", metrics.senderChainStale,
+			"storageConflicts", metrics.storageConflicts,
+			"balanceConflicts", metrics.balanceConflicts,
+			"nonceConflicts", metrics.nonceConflicts,
+			"codeConflicts", metrics.codeConflicts,
+			"existenceConflicts", metrics.existConflicts,
+			"incompleteConflicts", metrics.incomplete,
+			"hotConflictLocations", topParallelConflictLocations(metrics.conflictHotspots, 5),
 			"retries", metrics.retries,
 			"fallbacks", metrics.fallbacks,
 			"invalid", metrics.invalid,
@@ -459,7 +610,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 
 		var (
 			prior         []parallelCommittedResult
-			senderRetried = make(map[common.Address]bool)
+			senderRetried = make(map[common.Address]*parallelTask)
 			restart       bool
 		)
 		for _, task := range tasks {
@@ -516,16 +667,41 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 				}
 			}
 
-			conflict := senderRetried[task.sender] || parallelResultConflicts(task, prior)
+			invalidatingTask, senderChainInvalidated := senderRetried[task.sender]
+			var directConflict *parallelConflict
+			if !senderChainInvalidated {
+				directConflict = parallelResultConflict(task, prior)
+			}
+			conflict := senderChainInvalidated || directConflict != nil
 			if conflict {
 				metrics.conflicts++
-				senderRetried[task.sender] = true
-				log.Debug("Retrying optimistic transaction after stale state read", "hash", task.tx.Hash(), "sender", task.sender, "index", env.tcount)
+				if senderChainInvalidated {
+					metrics.senderChainStale++
+					log.Debug("Retrying optimistic transaction after sender chain invalidation",
+						"hash", task.tx.Hash(),
+						"sender", task.sender,
+						"position", task.position,
+						"index", env.tcount,
+						"invalidatedBy", invalidatingTask.tx.Hash(),
+						"invalidatedByPosition", invalidatingTask.position,
+						"reason", "sender-chain-invalidated",
+					)
+				} else {
+					metrics.recordDirectConflict(directConflict)
+					logParallelConflict(task, env.tcount, directConflict)
+					senderRetried[task.sender] = task
+				}
 				if miner.config.ParallelRetries > 0 {
 					started := time.Now()
 					task.result = miner.retryParallelTask(env, task)
-					metrics.retryTime += time.Since(started)
+					duration := time.Since(started)
+					metrics.retryTime += duration
 					metrics.retries++
+					var retryErr error
+					if task.result != nil {
+						retryErr = task.result.err
+					}
+					log.Debug("Reexecuted optimistic transaction", "hash", task.tx.Hash(), "sender", task.sender, "position", task.position, "index", env.tcount, "duration", duration, "err", retryErr)
 				} else {
 					metrics.fallbacks++
 					env.state.SetTxContext(task.tx.Hash(), env.tcount, uint32(env.tcount+1))
@@ -540,7 +716,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 					}
 					ordered.Shift()
 					metrics.committed++
-					prior = append(prior, parallelCommittedResult{sender: task.sender, state: sequentialState})
+					prior = append(prior, parallelCommittedResult{hash: task.tx.Hash(), position: task.position, sender: task.sender, state: sequentialState})
 					continue
 				}
 			}
@@ -576,7 +752,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			}
 			metrics.committed++
 			ordered.Shift()
-			prior = append(prior, parallelCommittedResult{sender: task.sender, state: task.result.state})
+			prior = append(prior, parallelCommittedResult{hash: task.tx.Hash(), position: task.position, sender: task.sender, state: task.result.state})
 		}
 		if restart {
 			continue

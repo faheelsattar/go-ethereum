@@ -38,6 +38,22 @@ type ParallelStorageLocation struct {
 	Slot    common.Hash
 }
 
+type ParallelConflictKind uint8
+
+const (
+	ParallelAccountConflict ParallelConflictKind = iota
+	ParallelStorageConflict
+)
+
+// ParallelStateConflict describes the first state dependency found between a
+// speculative result and an earlier committed result.
+type ParallelStateConflict struct {
+	Kind          ParallelConflictKind
+	Address       common.Address
+	Slot          common.Hash
+	AccountFields ParallelAccountFields
+}
+
 // ParallelStateAccesses contains the consensus-state footprint of one
 // transaction execution.
 type ParallelStateAccesses struct {
@@ -154,6 +170,10 @@ func (s *StateDB) recordBalanceWrite(addr common.Address, amount *uint256.Int, r
 	if s.parallelRecorder == nil {
 		return
 	}
+
+	if amount.IsZero() {
+		return
+	}
 	s.recordAccountWrite(addr, ParallelAccountBalance)
 	if reason == tracing.BalanceIncreaseRewardTransactionFee {
 		delta := s.parallelRecorder.feeCredits[addr]
@@ -182,6 +202,10 @@ func (r *parallelStateRecorder) capture(s *StateDB) {
 			SelfDestructed: mutation.counts[journalMutationKindSelfDestruct] > 0,
 		}
 		obj := s.stateObjects[addr]
+
+		if change.Created && !change.SelfDestructed && obj != nil && obj.empty() && !mutation.balanceSet && !mutation.nonceSet && !mutation.codeSet {
+			continue
+		}
 		if obj != nil && obj.empty() {
 			r.accesses.AccountWrites[addr] |= ParallelAccountExistence
 		}
@@ -268,32 +292,42 @@ func (r *ParallelStateResult) account(addr common.Address) *ParallelAccountChang
 	return change
 }
 
-// Conflicts reports whether this result read state modified by an earlier
-// result that was not part of its speculative input state.
-func (r *ParallelStateResult) Conflicts(previous *ParallelStateResult) bool {
+// Conflict returns the first state dependency found where this result read
+// state modified by an earlier result that was not part of its speculative
+// input state.
+func (r *ParallelStateResult) Conflict(previous *ParallelStateResult) *ParallelStateConflict {
 	if r == nil || previous == nil {
-		return false
+		return nil
 	}
 	for addr, reads := range r.Accesses.AccountReads {
 		writes := previous.Accesses.AccountWrites[addr]
-		if writes&ParallelAccountExistence != 0 || reads&writes != 0 {
-			return true
+		if writes&ParallelAccountExistence != 0 {
+			return &ParallelStateConflict{Kind: ParallelAccountConflict, Address: addr, AccountFields: ParallelAccountExistence}
+		}
+		if fields := reads & writes; fields != 0 {
+			return &ParallelStateConflict{Kind: ParallelAccountConflict, Address: addr, AccountFields: fields}
 		}
 	}
 	for location := range r.Accesses.StorageReads {
 		if _, ok := previous.Accesses.StorageWrites[location]; ok {
-			return true
+			return &ParallelStateConflict{Kind: ParallelStorageConflict, Address: location.Address, Slot: location.Slot}
 		}
 		if previous.Accesses.AccountWrites[location.Address]&ParallelAccountExistence != 0 {
-			return true
+			return &ParallelStateConflict{Kind: ParallelAccountConflict, Address: location.Address, AccountFields: ParallelAccountExistence}
 		}
 	}
 	for addr, writes := range r.Accesses.AccountWrites {
 		if writes != 0 && previous.Accesses.AccountWrites[addr]&ParallelAccountExistence != 0 {
-			return true
+			return &ParallelStateConflict{Kind: ParallelAccountConflict, Address: addr, AccountFields: ParallelAccountExistence}
 		}
 	}
-	return false
+	return nil
+}
+
+// Conflicts reports whether this result has a stale state dependency on an
+// earlier result.
+func (r *ParallelStateResult) Conflicts(previous *ParallelStateResult) bool {
+	return r.Conflict(previous) != nil
 }
 
 // ApplyParallelResult merges a non-conflicting transaction result into s and
