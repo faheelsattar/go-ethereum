@@ -87,6 +87,7 @@ type parallelBuildMetrics struct {
 	invalid          int
 	maxActiveWorkers int
 	executionWork    time.Duration
+	planningTime     time.Duration
 	stateCopy        time.Duration
 	mergeTime        time.Duration
 	retryTime        time.Duration
@@ -546,6 +547,9 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 	metrics := &parallelBuildMetrics{started: time.Now()}
 	workers := miner.parallelWorkerCount()
 	defer func() {
+		if env.benchmark != nil {
+			env.benchmark.addParallelMetrics(metrics)
+		}
 		log.Info("Parallel block execution summary",
 			"build", parallelDependencyBuildID(env.dependency),
 			"number", env.header.Number,
@@ -597,7 +601,9 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			blobTxs.Clear()
 			// Fall though to pick up any plain txs
 		}
+		planningStarted := time.Now()
 		tasks, chains := planParallelTasks(env, plainTxs, blobTxs)
+		metrics.planningTime += time.Since(planningStarted)
 		if len(tasks) == 0 {
 			break
 		}
@@ -700,6 +706,8 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 					var retryErr error
 					if task.result != nil {
 						retryErr = task.result.err
+						metrics.executionWork += task.result.duration
+						metrics.stateCopy += task.result.stateCopy
 					}
 					log.Debug("Reexecuted optimistic transaction", "hash", task.tx.Hash(), "sender", task.sender, "position", task.position, "index", env.tcount, "duration", duration, "err", retryErr)
 				} else {
