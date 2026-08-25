@@ -76,21 +76,23 @@ func (args *BuildPayloadArgs) Id() engine.PayloadID {
 // the revenue. Therefore, the empty-block here is always available and full-block
 // will be set/updated afterwards.
 type Payload struct {
-	id                engine.PayloadID
-	empty             *types.Block
-	emptyWitness      *stateless.Witness
-	emptyDependency   *dependencyAnalyzer
-	full              *types.Block
-	fullWitness       *stateless.Witness
-	fullDependency    *dependencyAnalyzer
-	dependencyWritten bool
-	sidecars          []*types.BlobTxSidecar
-	emptyRequests     [][]byte
-	requests          [][]byte
-	fullFees          *big.Int
-	stop              chan struct{}
-	lock              sync.Mutex
-	cond              *sync.Cond
+	id                 engine.PayloadID
+	empty              *types.Block
+	emptyWitness       *stateless.Witness
+	emptyDependency    *dependencyAnalyzer
+	full               *types.Block
+	fullWitness        *stateless.Witness
+	fullDependency     *dependencyAnalyzer
+	dependencyWritten  bool
+	fullBenchmark      *buildBenchmarkAttempt
+	benchmarkDelivered bool
+	sidecars           []*types.BlobTxSidecar
+	emptyRequests      [][]byte
+	requests           [][]byte
+	fullFees           *big.Int
+	stop               chan struct{}
+	lock               sync.Mutex
+	cond               *sync.Cond
 }
 
 // newPayload initializes the payload object.
@@ -129,6 +131,7 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 		payload.requests = r.requests
 		payload.fullWitness = r.witness
 		payload.fullDependency = r.dependency
+		payload.fullBenchmark = r.benchmark
 
 		feesInEther := new(big.Float).Quo(new(big.Float).SetInt(r.fees), big.NewFloat(params.Ether))
 		log.Info("Updated payload",
@@ -143,6 +146,9 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 			"elapsed", common.PrettyDuration(elapsed),
 		)
 		result = true
+	}
+	if r.benchmark != nil {
+		r.benchmark.recordCompleted(r, elapsed, result)
 	}
 	payload.cond.Broadcast() // fire signal for notifying full block
 	return
@@ -160,6 +166,7 @@ func (payload *Payload) Resolve() *engine.ExecutionPayloadEnvelope {
 		close(payload.stop)
 	}
 	payload.writeDependencyDOT()
+	payload.writeBenchmarkDelivery()
 	if payload.full != nil {
 		envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 		if payload.fullWitness != nil {
@@ -214,12 +221,21 @@ func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 		close(payload.stop)
 	}
 	payload.writeDependencyDOT()
+	payload.writeBenchmarkDelivery()
 	envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 	if payload.fullWitness != nil {
 		envelope.Witness = new(hexutil.Bytes)
 		*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 	}
 	return envelope
+}
+
+func (payload *Payload) writeBenchmarkDelivery() {
+	if payload.benchmarkDelivered || payload.full == nil || payload.fullBenchmark == nil {
+		return
+	}
+	payload.fullBenchmark.recordDelivered(payload.full)
+	payload.benchmarkDelivered = true
 }
 
 // writeDependencyDOT writes the graph for the payload selected for delivery.
@@ -258,12 +274,20 @@ func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iter
 	var err error
 	defer spanEnd(&err)
 
-	r := miner.generateWork(ctx, params, witness)
+	benchmark := miner.newBenchmarkAttempt(payload.id, iteration)
+	r := miner.generateWorkWithBenchmark(ctx, params, witness, benchmark)
+	elapsed := time.Since(start)
 	err = r.err
 	if err == nil {
-		accepted := payload.update(r, time.Since(start))
+		if benchmark != nil {
+			benchmark.totalBuildWall = elapsed
+		}
+		accepted := payload.update(r, elapsed)
 		span.SetAttributes(telemetry.BoolAttribute("update.accepted", accepted))
 	} else {
+		if benchmark != nil {
+			benchmark.recordInterrupted(elapsed, err)
+		}
 		log.Info("Error while generating work", "id", payload.id, "err", err)
 	}
 }

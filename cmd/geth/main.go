@@ -115,6 +115,8 @@ var (
 		utils.MinerDependencyAnalysisFlag,
 		utils.MinerDependencyDotDirFlag,
 		utils.MinerParallelExecutionFlag,
+		utils.MinerParallelBenchmarkModeFlag,
+		utils.MinerParallelBenchmarkOutputFlag,
 		utils.MinerParallelWorkersFlag,
 		utils.MinerParallelRetriesFlag,
 		utils.MinerRecommitIntervalFlag,

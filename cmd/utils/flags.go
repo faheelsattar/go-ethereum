@@ -622,6 +622,17 @@ var (
 		Usage:    "Execute transactions optimistically with a shared worker pool during block construction",
 		Category: flags.MinerCategory,
 	}
+	MinerParallelBenchmarkModeFlag = &cli.StringFlag{
+		Name:     "miner.parallel-benchmark-mode",
+		Usage:    "Parallel execution benchmark mode: off, paired, or alternate",
+		Value:    ethconfig.Defaults.Miner.ParallelBenchmarkMode,
+		Category: flags.MinerCategory,
+	}
+	MinerParallelBenchmarkOutputFlag = &cli.PathFlag{
+		Name:     "miner.parallel-benchmark-output",
+		Usage:    "JSONL output file for parallel execution benchmark events",
+		Category: flags.MinerCategory,
+	}
 	MinerParallelWorkersFlag = &cli.UintFlag{
 		Name:     "miner.parallel-workers",
 		Usage:    "Maximum optimistic transaction execution workers (capped by GOMAXPROCS)",
@@ -1761,6 +1772,20 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(MinerParallelExecutionFlag.Name) {
 		cfg.ParallelExecution = ctx.Bool(MinerParallelExecutionFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelBenchmarkModeFlag.Name) {
+		cfg.ParallelBenchmarkMode = strings.ToLower(ctx.String(MinerParallelBenchmarkModeFlag.Name))
+	}
+	switch cfg.ParallelBenchmarkMode {
+	case "", "off":
+		cfg.ParallelBenchmarkMode = "off"
+	case "paired", "alternate":
+		cfg.ParallelExecution = true
+	default:
+		Fatalf("--%s must be 'off', 'paired', or 'alternate'", MinerParallelBenchmarkModeFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelBenchmarkOutputFlag.Name) {
+		cfg.ParallelBenchmarkOutput = ctx.Path(MinerParallelBenchmarkOutputFlag.Name)
 	}
 	if ctx.IsSet(MinerParallelWorkersFlag.Name) {
 		cfg.ParallelWorkers = int(ctx.Uint(MinerParallelWorkersFlag.Name))
