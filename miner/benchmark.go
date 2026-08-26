@@ -38,6 +38,8 @@ type buildBenchmarkAttempt struct {
 	transactionWall         time.Duration
 	totalBuildWall          time.Duration
 	evmExecutionWork        time.Duration
+	resolutionWork          time.Duration
+	blobResolutionWork      time.Duration
 	sequentialWall          time.Duration
 	sequentialExecutionWork time.Duration
 	stateCopy               time.Duration
@@ -68,6 +70,9 @@ type buildBenchmarkAttempt struct {
 	invalid          int
 	sequentialErrors int
 	maxActiveWorkers int
+	resolveCount     int
+	blobResolveCount int
+	resolveCacheHits int
 
 	txMatch      *bool
 	receiptMatch *bool
@@ -100,6 +105,8 @@ type benchmarkEvent struct {
 	TotalBuildWallNs           int64 `json:"totalBuildWallNs,omitempty"`
 	TransactionExecutionWallNs int64 `json:"transactionExecutionWallNs,omitempty"`
 	EVMExecutionWorkNs         int64 `json:"evmExecutionWorkNs,omitempty"`
+	ResolutionWorkNs           int64 `json:"resolutionWorkNs,omitempty"`
+	BlobResolutionWorkNs       int64 `json:"blobResolutionWorkNs,omitempty"`
 	SequentialWallNs           int64 `json:"sequentialWallNs,omitempty"`
 	SequentialExecutionWorkNs  int64 `json:"sequentialExecutionWorkNs,omitempty"`
 	PlanningNs                 int64 `json:"planningNs,omitempty"`
@@ -130,6 +137,9 @@ type benchmarkEvent struct {
 	Fallbacks                int `json:"fallbacks,omitempty"`
 	Invalid                  int `json:"invalid,omitempty"`
 	SequentialErrors         int `json:"sequentialErrors,omitempty"`
+	ResolveCount             int `json:"resolveCount,omitempty"`
+	BlobResolveCount         int `json:"blobResolveCount,omitempty"`
+	ResolveCacheHits         int `json:"resolveCacheHits,omitempty"`
 
 	TxMatch      *bool `json:"txMatch,omitempty"`
 	ReceiptMatch *bool `json:"receiptMatch,omitempty"`
@@ -217,10 +227,15 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.sequentialErrors += metrics.sequentialErrors
 	attempt.maxActiveWorkers = max(attempt.maxActiveWorkers, metrics.maxActiveWorkers)
 	attempt.evmExecutionWork += metrics.executionWork
+	attempt.resolutionWork += metrics.resolutionWork
+	attempt.blobResolutionWork += metrics.blobResolveWork
 	attempt.stateCopy += metrics.stateCopy
 	attempt.mergeTime += metrics.mergeTime
 	attempt.retryTime += metrics.retryTime
 	attempt.planningTime += metrics.planningTime
+	attempt.resolveCount += metrics.resolveCount
+	attempt.blobResolveCount += metrics.blobResolveCount
+	attempt.resolveCacheHits += metrics.resolveCacheHits
 }
 
 func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
@@ -236,6 +251,8 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		TransactionExecutionWallNs: attempt.transactionWall.Nanoseconds(),
 		TotalBuildWallNs:           attempt.totalBuildWall.Nanoseconds(),
 		EVMExecutionWorkNs:         attempt.evmExecutionWork.Nanoseconds(),
+		ResolutionWorkNs:           attempt.resolutionWork.Nanoseconds(),
+		BlobResolutionWorkNs:       attempt.blobResolutionWork.Nanoseconds(),
 		SequentialWallNs:           attempt.sequentialWall.Nanoseconds(),
 		SequentialExecutionWorkNs:  attempt.sequentialExecutionWork.Nanoseconds(),
 		PlanningNs:                 attempt.planningTime.Nanoseconds(),
@@ -265,6 +282,9 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		Fallbacks:                  attempt.fallbacks,
 		Invalid:                    attempt.invalid,
 		SequentialErrors:           attempt.sequentialErrors,
+		ResolveCount:               attempt.resolveCount,
+		BlobResolveCount:           attempt.blobResolveCount,
+		ResolveCacheHits:           attempt.resolveCacheHits,
 		TxMatch:                    attempt.txMatch,
 		ReceiptMatch:               attempt.receiptMatch,
 		GasMatch:                   attempt.gasMatch,
