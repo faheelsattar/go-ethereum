@@ -42,15 +42,17 @@ const (
 // on any worker, but a same-sender successor becomes runnable only after its
 // predecessor has completed successfully.
 type parallelTask struct {
-	position int
-	source   parallelTxSource
-	lazy     *txpool.LazyTransaction
-	tx       *types.Transaction
-	sender   common.Address
-	chain    *parallelSenderChain
-	previous *parallelTask
-	next     *parallelTask
-	result   *parallelExecutionResult
+	position     int
+	source       parallelTxSource
+	lazy         *txpool.LazyTransaction
+	tx           *types.Transaction
+	sender       common.Address
+	chain        *parallelSenderChain
+	previous     *parallelTask
+	next         *parallelTask
+	result       *parallelExecutionResult
+	blobGasLimit bool
+	blobGasLeft  uint64
 }
 
 // parallelSenderChain carries speculative state between nonce-dependent
@@ -63,14 +65,47 @@ type parallelSenderChain struct {
 }
 
 type parallelExecutionResult struct {
-	receipt    *types.Receipt
-	bal        *bal.ConstructionBlockAccessList
-	state      *state.ParallelStateResult
-	gas        core.GasPoolDelta
-	dependency *transactionAccess
-	err        error
-	duration   time.Duration
-	stateCopy  time.Duration
+	receipt         *types.Receipt
+	bal             *bal.ConstructionBlockAccessList
+	state           *state.ParallelStateResult
+	gas             core.GasPoolDelta
+	dependency      *transactionAccess
+	err             error
+	duration        time.Duration
+	stateCopy       time.Duration
+	resolveTime     time.Duration
+	resolveCount    int
+	resolveCacheHit bool
+}
+
+type parallelTransactionResolver struct {
+	mu           sync.Mutex
+	transactions map[common.Hash]*types.Transaction
+}
+
+func newParallelTransactionResolver() *parallelTransactionResolver {
+	return &parallelTransactionResolver{transactions: make(map[common.Hash]*types.Transaction)}
+}
+
+func (r *parallelTransactionResolver) resolve(lazy *txpool.LazyTransaction) (*types.Transaction, bool, time.Duration) {
+	r.mu.Lock()
+	tx, ok := r.transactions[lazy.Hash]
+	r.mu.Unlock()
+	if ok {
+		return tx, true, 0
+	}
+	started := time.Now()
+	tx = lazy.Resolve()
+	duration := time.Since(started)
+	r.mu.Lock()
+	if cached, exists := r.transactions[lazy.Hash]; exists {
+		tx = cached
+		ok = true
+	} else {
+		r.transactions[lazy.Hash] = tx
+	}
+	r.mu.Unlock()
+	return tx, ok, duration
 }
 
 type parallelBuildMetrics struct {
@@ -87,12 +122,17 @@ type parallelBuildMetrics struct {
 	invalid          int
 	maxActiveWorkers int
 	executionWork    time.Duration
+	resolutionWork   time.Duration
+	blobResolveWork  time.Duration
 	planningTime     time.Duration
 	stateCopy        time.Duration
 	mergeTime        time.Duration
 	retryTime        time.Duration
 	committed        int
 	sequentialErrors int
+	resolveCount     int
+	blobResolveCount int
+	resolveCacheHits int
 	directConflicts  int
 	senderChainStale int
 	storageConflicts int
@@ -145,17 +185,22 @@ func parallelExecutionSupported(env *environment) (bool, string) {
 }
 
 func peekParallelTransaction(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce) (parallelTxSource, *txpool.LazyTransaction) {
-	pltx, ptip := plainTxs.Peek()
-	bltx, btip := blobTxs.Peek()
+	source, tx, _ := peekParallelTransactionWithSender(plainTxs, blobTxs)
+	return source, tx
+}
+
+func peekParallelTransactionWithSender(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce) (parallelTxSource, *txpool.LazyTransaction, common.Address) {
+	pltx, plfrom, ptip := plainTxs.PeekWithSender()
+	bltx, blfrom, btip := blobTxs.PeekWithSender()
 	switch {
 	case pltx == nil:
-		return parallelBlobTx, bltx
+		return parallelBlobTx, bltx, blfrom
 	case bltx == nil:
-		return parallelPlainTx, pltx
+		return parallelPlainTx, pltx, plfrom
 	case ptip.Lt(btip):
-		return parallelBlobTx, bltx
+		return parallelBlobTx, bltx, blfrom
 	default:
-		return parallelPlainTx, pltx
+		return parallelPlainTx, pltx, plfrom
 	}
 }
 
@@ -168,30 +213,38 @@ func transactionSource(source parallelTxSource, plainTxs, blobTxs *txorder.Trans
 
 // planParallelTasks consumes copies of Geth's ordering queues, leaving the
 // originals untouched for ordered validation and commit.
-func planParallelTasks(env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce) ([]*parallelTask, int) {
+func planParallelTasks(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, availableBlobGas uint64) ([]*parallelTask, int) {
 	plainCopy, blobCopy := plainTxs.Copy(), blobTxs.Copy()
 	chains := make(map[common.Address]*parallelSenderChain)
 	lastTaskBySender := make(map[common.Address]*parallelTask)
+	var plannedBlobGas uint64
 	var tasks []*parallelTask
 
 	for {
 		// peek transaction by price
-		source, lazy := peekParallelTransaction(plainCopy, blobCopy)
+		source, lazy, sender := peekParallelTransactionWithSender(plainCopy, blobCopy)
 		if lazy == nil {
 			break
 		}
 		// we now need to select the queue from which we will be removing
 		// the peeked transaction which we did above
 		selectedQueue := transactionSource(source, plainCopy, blobCopy)
-		tx := lazy.Resolve()
-		if tx == nil {
-			tasks = append(tasks, &parallelTask{position: len(tasks), source: source, lazy: lazy})
+		if source == parallelBlobTx && lazy.BlobGas > availableBlobGas-plannedBlobGas {
+			// Ordered commit will discard this sender and replan. Keep the
+			// non-fitting transaction as a sentinel, but don't resolve it or
+			// speculatively execute transactions that follow it.
+			tasks = append(tasks, &parallelTask{
+				position:     len(tasks),
+				source:       source,
+				lazy:         lazy,
+				sender:       sender,
+				blobGasLimit: true,
+				blobGasLeft:  availableBlobGas - plannedBlobGas,
+			})
 			break
 		}
-		sender, err := types.Sender(env.signer, tx)
-		if err != nil {
-			tasks = append(tasks, &parallelTask{position: len(tasks), source: source, lazy: lazy, tx: tx})
-			break
+		if source == parallelBlobTx {
+			plannedBlobGas += lazy.BlobGas
 		}
 		chain := chains[sender]
 		if chain == nil {
@@ -202,7 +255,6 @@ func planParallelTasks(env *environment, plainTxs, blobTxs *txorder.Transactions
 			position: len(tasks),
 			source:   source,
 			lazy:     lazy,
-			tx:       tx,
 			sender:   sender,
 			chain:    chain,
 		}
@@ -221,19 +273,30 @@ func planParallelTasks(env *environment, plainTxs, blobTxs *txorder.Transactions
 	return tasks, len(chains)
 }
 
-func (miner *Miner) executeParallelTask(env *environment, task *parallelTask) {
+func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, resolver *parallelTransactionResolver) {
+	if task.result == nil {
+		task.result = new(parallelExecutionResult)
+	}
+	result := task.result
+	if task.tx == nil {
+		result.resolveCount = 1
+		tx, cached, duration := resolver.resolve(task.lazy)
+		result.resolveTime = duration
+		result.resolveCacheHit = cached
+		if tx == nil {
+			result.err = errors.New("transaction is no longer available")
+			return
+		}
+		task.tx = tx
+	}
 	chain := task.chain
 	if chain.state == nil {
 		started := time.Now()
 		chain.state = env.state.Copy()
 		chain.gas = env.gasPool.Snapshot()
 		chain.header = types.CopyHeader(env.header)
-		task.result = &parallelExecutionResult{stateCopy: time.Since(started)}
+		result.stateCopy = time.Since(started)
 	}
-	if task.result == nil {
-		task.result = new(parallelExecutionResult)
-	}
-	result := task.result
 
 	var analyzer *dependencyAnalyzer
 	vmConfig := vm.Config{}
@@ -286,7 +349,7 @@ func insertParallelReadyTask(ready []*parallelTask, task *parallelTask) []*paral
 // executeParallelTasks runs a work-conserving scheduler. Workers are generic:
 // completing a task releases its same-sender successor back to the shared
 // ready queue, where any worker may pick it up.
-func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask, workers int, interrupt *atomic.Int32, metrics *parallelBuildMetrics) bool {
+func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask, workers int, interrupt *atomic.Int32, resolver *parallelTransactionResolver, metrics *parallelBuildMetrics) bool {
 	var ready []*parallelTask
 	for _, task := range tasks {
 		if task.chain != nil && task.previous == nil {
@@ -305,7 +368,7 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 		go func() {
 			defer wg.Done()
 			for task := range jobs {
-				miner.executeParallelTask(env, task)
+				miner.executeParallelTask(env, task, resolver)
 				done <- task
 			}
 		}()
@@ -335,6 +398,15 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 			metrics.speculative++
 			metrics.executionWork += task.result.duration
 			metrics.stateCopy += task.result.stateCopy
+			metrics.resolutionWork += task.result.resolveTime
+			metrics.resolveCount += task.result.resolveCount
+			if task.source == parallelBlobTx {
+				metrics.blobResolveWork += task.result.resolveTime
+				metrics.blobResolveCount += task.result.resolveCount
+			}
+			if task.result.resolveCacheHit {
+				metrics.resolveCacheHits++
+			}
 			if task.result.err == nil && task.next != nil && !interrupted {
 				ready = insertParallelReadyTask(ready, task.next)
 			}
@@ -358,7 +430,7 @@ func (miner *Miner) retryParallelTask(env *environment, task *parallelTask) *par
 		sender: task.sender,
 		chain:  new(parallelSenderChain),
 	}
-	miner.executeParallelTask(env, retry)
+	miner.executeParallelTask(env, retry, nil)
 	return retry.result
 }
 
@@ -546,6 +618,7 @@ func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTas
 func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
 	metrics := &parallelBuildMetrics{started: time.Now()}
 	workers := miner.parallelWorkerCount()
+	resolver := newParallelTransactionResolver()
 	defer func() {
 		if env.benchmark != nil {
 			env.benchmark.addParallelMetrics(metrics)
@@ -578,6 +651,11 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			"sequentialErrors", metrics.sequentialErrors,
 			"wall", time.Since(metrics.started),
 			"executionWork", metrics.executionWork,
+			"resolutionWork", metrics.resolutionWork,
+			"blobResolutionWork", metrics.blobResolveWork,
+			"resolveCount", metrics.resolveCount,
+			"blobResolveCount", metrics.blobResolveCount,
+			"resolveCacheHits", metrics.resolveCacheHits,
 			"stateCopy", metrics.stateCopy,
 			"mergeTime", metrics.mergeTime,
 			"retryTime", metrics.retryTime,
@@ -602,7 +680,12 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			// Fall though to pick up any plain txs
 		}
 		planningStarted := time.Now()
-		tasks, chains := planParallelTasks(env, plainTxs, blobTxs)
+		availableBlobGas := ^uint64(0)
+		if !blobTxs.Empty() {
+			availableBlobs := miner.maxBlobsPerBlock(env.header.Time) - env.blobs
+			availableBlobGas = uint64(availableBlobs) * params.BlobTxBlobGasPerBlob
+		}
+		tasks, chains := planParallelTasks(plainTxs, blobTxs, availableBlobGas)
 		metrics.planningTime += time.Since(planningStarted)
 		if len(tasks) == 0 {
 			break
@@ -610,7 +693,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		metrics.planned += len(tasks)
 		metrics.senderChains = max(metrics.senderChains, chains)
 		log.Debug("Executing optimistic transaction queue", "number", env.header.Number, "transactions", len(tasks), "senderChains", chains, "workers", workers)
-		if !miner.executeParallelTasks(env, tasks, workers, interrupt, metrics) {
+		if !miner.executeParallelTasks(env, tasks, workers, interrupt, resolver, metrics) {
 			return signalToErr(interrupt.Load())
 		}
 
@@ -636,6 +719,16 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			if env.dependency != nil {
 				candidateRank = env.dependency.nextCandidate()
 				env.candidateRank = candidateRank
+			}
+			if task.blobGasLimit {
+				log.Trace("Not enough blob space left for transaction", "hash", task.lazy.Hash, "left", task.blobGasLeft/params.BlobTxBlobGasPerBlob, "needed", task.lazy.BlobGas/params.BlobTxBlobGasPerBlob)
+				if env.dependency != nil {
+					env.dependency.logCandidate(candidateRank, task.lazy.Hash, "skipped", "blob-gas-limit", nil)
+				}
+				ordered.Pop()
+				metrics.invalid++
+				restart = true
+				break
 			}
 			if task.tx == nil {
 				ordered.Pop()
