@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"reflect"
 	"sync/atomic"
 	"time"
 
@@ -81,8 +80,7 @@ type environment struct {
 	dependency    *dependencyAnalyzer
 	candidateRank uint64
 
-	benchmark                     *buildBenchmarkAttempt
-	benchmarkSequentialComparison bool
+	benchmark *buildBenchmarkAttempt
 }
 
 // txFitsSize reports whether the transaction fits into the block size limit.
@@ -205,11 +203,11 @@ func (miner *Miner) generateWorkWithBenchmark(ctx context.Context, genParam *gen
 
 			err := miner.fillTransactions(ctx, interrupt, work)
 			if errors.Is(err, errBlockInterruptedByTimeout) {
-				if benchmark != nil {
+				if benchmark != nil && benchmark.termination == "" {
 					benchmark.termination = "recommit"
 				}
 				log.Warn("Block building is interrupted", "allowance", common.PrettyDuration(miner.config.Recommit))
-			} else if err != nil && benchmark != nil {
+			} else if err != nil && benchmark != nil && benchmark.termination == "" {
 				benchmark.termination = err.Error()
 			}
 		}
@@ -470,11 +468,7 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 	receipt, bal, err := core.ApplyTransaction(env.evm, env.gasPool, env.state, env.header, tx)
 	duration := time.Since(start)
 	if env.benchmark != nil {
-		if env.benchmarkSequentialComparison {
-			env.benchmark.sequentialExecutionWork += duration
-		} else {
-			env.benchmark.evmExecutionWork += duration
-		}
+		env.benchmark.evmExecutionWork += duration
 	}
 	if err != nil {
 		if env.dependency != nil {
@@ -493,13 +487,8 @@ func (miner *Miner) applyTransaction(env *environment, tx *types.Transaction) (*
 
 func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
 	parallel := miner.config.ParallelExecution
-	if env.benchmark != nil {
-		switch env.benchmark.mode {
-		case parallelBenchmarkPaired:
-			parallel = true
-		case parallelBenchmarkAlternate:
-			parallel = env.benchmark.parallel()
-		}
+	if env.benchmark != nil && env.benchmark.mode == parallelBenchmarkAlternate {
+		parallel = env.benchmark.parallel()
 	}
 	if parallel {
 		if supported, reason := parallelExecutionSupported(env); supported {
@@ -649,108 +638,12 @@ func (miner *Miner) commitTransactionsSequential(ctx context.Context, env *envir
 	return nil
 }
 
-type parallelBenchmarkQueue struct {
-	plain *txorder.TransactionsByPriceAndNonce
-	blob  *txorder.TransactionsByPriceAndNonce
-}
-
-type pairedBenchmark struct {
-	env          *environment
-	queues       []parallelBenchmarkQueue
-	initialTxs   int
-	parallelWall time.Duration
-}
-
-func (miner *Miner) newPairedBenchmark(env *environment) *pairedBenchmark {
-	state := env.state.Copy()
-	header := types.CopyHeader(env.header)
-	vmConfig := env.evm.Config
-	vmConfig.Tracer = nil
-	benchmarkEnv := &environment{
-		signer:                        env.signer,
-		state:                         state,
-		tcount:                        env.tcount,
-		size:                          env.size,
-		gasPool:                       env.gasPool.Snapshot(),
-		coinbase:                      env.coinbase,
-		header:                        header,
-		txs:                           append([]*types.Transaction(nil), env.txs...),
-		receipts:                      append(types.Receipts(nil), env.receipts...),
-		sidecars:                      append([]*types.BlobTxSidecar(nil), env.sidecars...),
-		blobs:                         env.blobs,
-		bal:                           env.bal.Copy(),
-		benchmark:                     env.benchmark,
-		benchmarkSequentialComparison: true,
-	}
-	benchmarkEnv.evm = vm.NewEVM(core.NewEVMBlockContext(header, miner.chain, &benchmarkEnv.coinbase), state, miner.chainConfig, vmConfig)
-	return &pairedBenchmark{env: benchmarkEnv, initialTxs: env.tcount}
-}
-
-func sameTransactions(a, b []*types.Transaction) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i].Hash() != b[i].Hash() {
-			return false
-		}
-	}
-	return true
-}
-
-func (miner *Miner) runPairedBenchmark(ctx context.Context, env *environment, benchmark *pairedBenchmark) {
-	started := time.Now()
-	for _, queue := range benchmark.queues {
-		if err := miner.commitTransactionsSequential(ctx, benchmark.env, queue.plain, queue.blob, nil); err != nil {
-			log.Warn("Sequential comparison for parallel block execution failed", "number", env.header.Number, "err", err)
-			return
-		}
-	}
-	sequentialWall := time.Since(started)
-	env.benchmark.sequentialWall = sequentialWall
-
-	parallelState := env.state.Copy()
-	sequentialState := benchmark.env.state.Copy()
-	deleteEmpty := miner.chainConfig.IsEIP158(env.header.Number)
-	parallelRoot := parallelState.IntermediateRoot(deleteEmpty)
-	sequentialRoot := sequentialState.IntermediateRoot(deleteEmpty)
-	txMatch := sameTransactions(env.txs, benchmark.env.txs)
-	receiptMatch := reflect.DeepEqual(env.receipts, benchmark.env.receipts)
-	gasMatch := env.header.GasUsed == benchmark.env.header.GasUsed
-	stateMatch := parallelRoot == sequentialRoot
-	env.benchmark.txMatch = &txMatch
-	env.benchmark.receiptMatch = &receiptMatch
-	env.benchmark.gasMatch = &gasMatch
-	env.benchmark.stateMatch = &stateMatch
-	log.Info("Paired block execution benchmark",
-		"build", parallelDependencyBuildID(env.dependency),
-		"number", env.header.Number,
-		"workers", miner.parallelWorkerCount(),
-		"transactions", env.tcount-benchmark.initialTxs,
-		"parallelWall", env.benchmark.transactionWall,
-		"sequentialWall", sequentialWall,
-		"txMatch", txMatch,
-		"receiptMatch", receiptMatch,
-		"gasMatch", gasMatch,
-		"stateMatch", stateMatch,
-		"parallelRoot", parallelRoot,
-		"sequentialRoot", sequentialRoot,
-	)
-}
-
 // fillTransactions retrieves the pending transactions from the txpool and fills them
 // into the given sealing block. The transaction selection and ordering strategy can
 // be customized with the plugin in the future.
 func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int32, env *environment) (err error) {
 	ctx, span, spanEnd := telemetry.StartSpan(ctx, "miner.fillTransactions")
 	defer spanEnd(&err)
-	transactionStarted := time.Now()
-	transactionRecorded := false
-	defer func() {
-		if env.benchmark != nil && !transactionRecorded {
-			env.benchmark.transactionWall += time.Since(transactionStarted)
-		}
-	}()
 
 	miner.confMu.RLock()
 	tip := miner.config.GasPrice
@@ -773,13 +666,19 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 	filter.BlobTxs = false
 	pendingPlainTxs, plainTxCount := miner.txpool.Pending(filter)
 
-	filter.BlobTxs = true
-	if miner.chainConfig.IsOsaka(env.header.Number, env.header.Time) {
-		filter.BlobVersion = types.BlobSidecarVersion1
-	} else {
-		filter.BlobVersion = types.BlobSidecarVersion0
+	var (
+		pendingBlobTxs map[common.Address][]*txpool.LazyTransaction
+		blobTxCount    int
+	)
+	if env.benchmark == nil || !env.benchmark.noBlobs {
+		filter.BlobTxs = true
+		if miner.chainConfig.IsOsaka(env.header.Number, env.header.Time) {
+			filter.BlobVersion = types.BlobSidecarVersion1
+		} else {
+			filter.BlobVersion = types.BlobSidecarVersion0
+		}
+		pendingBlobTxs, blobTxCount = miner.txpool.Pending(filter)
 	}
-	pendingBlobTxs, blobTxCount := miner.txpool.Pending(filter)
 	if env.dependency != nil {
 		env.dependency.setPendingCounts(plainTxCount, blobTxCount)
 	}
@@ -802,51 +701,31 @@ func (miner *Miner) fillTransactions(ctx context.Context, interrupt *atomic.Int3
 			prioBlobTxs[account] = txs
 		}
 	}
-	var benchmark *pairedBenchmark
-	if env.benchmark != nil && env.benchmark.mode == parallelBenchmarkPaired {
-		if supported, reason := parallelExecutionSupported(env); supported {
-			benchmark = miner.newPairedBenchmark(env)
-			defer benchmark.env.discard()
-		} else {
-			env.benchmark.termination = "parallel-unsupported"
-			log.Warn("Paired block execution benchmark disabled for build", "number", env.header.Number, "reason", reason)
+	// commitPhase runs one queue pair through the commit loop.
+	// transactionWall covers exactly the commit loops so the metric is
+	// comparable between sequential and parallel builds.
+	commitPhase := func(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce) error {
+		started := time.Now()
+		err := miner.commitTransactions(ctx, env, plainTxs, blobTxs, interrupt)
+		if env.benchmark != nil {
+			env.benchmark.transactionWall += time.Since(started)
 		}
+		return err
 	}
 	// Fill the block with all available pending transactions.
 	if len(prioPlainTxs) > 0 || len(prioBlobTxs) > 0 {
 		plainTxs := txorder.NewTransactionsByPriceAndNonce(env.signer, prioPlainTxs, env.header.BaseFee)
 		blobTxs := txorder.NewTransactionsByPriceAndNonce(env.signer, prioBlobTxs, env.header.BaseFee)
-
-		if benchmark != nil {
-			benchmark.queues = append(benchmark.queues, parallelBenchmarkQueue{plain: plainTxs.Copy(), blob: blobTxs.Copy()})
-		}
-		started := time.Now()
-		if err := miner.commitTransactions(ctx, env, plainTxs, blobTxs, interrupt); err != nil {
+		if err := commitPhase(plainTxs, blobTxs); err != nil {
 			return err
-		}
-		if benchmark != nil {
-			benchmark.parallelWall += time.Since(started)
 		}
 	}
 	if len(normalPlainTxs) > 0 || len(normalBlobTxs) > 0 {
 		plainTxs := txorder.NewTransactionsByPriceAndNonce(env.signer, normalPlainTxs, env.header.BaseFee)
 		blobTxs := txorder.NewTransactionsByPriceAndNonce(env.signer, normalBlobTxs, env.header.BaseFee)
-
-		if benchmark != nil {
-			benchmark.queues = append(benchmark.queues, parallelBenchmarkQueue{plain: plainTxs.Copy(), blob: blobTxs.Copy()})
-		}
-		started := time.Now()
-		if err := miner.commitTransactions(ctx, env, plainTxs, blobTxs, interrupt); err != nil {
+		if err := commitPhase(plainTxs, blobTxs); err != nil {
 			return err
 		}
-		if benchmark != nil {
-			benchmark.parallelWall += time.Since(started)
-		}
-	}
-	if benchmark != nil && len(benchmark.queues) > 0 {
-		env.benchmark.transactionWall = benchmark.parallelWall
-		transactionRecorded = true
-		miner.runPairedBenchmark(ctx, env, benchmark)
 	}
 	return nil
 }

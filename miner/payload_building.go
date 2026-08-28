@@ -158,28 +158,32 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 // thread for updating payload. It's safe to be called multiple times.
 func (payload *Payload) Resolve() *engine.ExecutionPayloadEnvelope {
 	payload.lock.Lock()
-	defer payload.lock.Unlock()
 
 	select {
 	case <-payload.stop:
 	default:
 		close(payload.stop)
 	}
-	payload.writeDependencyDOT()
-	payload.writeBenchmarkDelivery()
+	artifacts := payload.takeDeliveryArtifacts()
+	var envelope *engine.ExecutionPayloadEnvelope
 	if payload.full != nil {
-		envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
+		envelope = engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 		if payload.fullWitness != nil {
 			envelope.Witness = new(hexutil.Bytes)
 			*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 		}
-		return envelope
+	} else {
+		envelope = engine.BlockToExecutableData(payload.empty, big.NewInt(0), nil, payload.emptyRequests)
+		if payload.emptyWitness != nil {
+			envelope.Witness = new(hexutil.Bytes)
+			*envelope.Witness, _ = rlp.EncodeToBytes(payload.emptyWitness) // cannot fail
+		}
 	}
-	envelope := engine.BlockToExecutableData(payload.empty, big.NewInt(0), nil, payload.emptyRequests)
-	if payload.emptyWitness != nil {
-		envelope.Witness = new(hexutil.Bytes)
-		*envelope.Witness, _ = rlp.EncodeToBytes(payload.emptyWitness) // cannot fail
-	}
+	payload.lock.Unlock()
+
+	// Delivery artifacts hit the disk; write them outside the lock so a slow
+	// write cannot stall engine_getPayload.
+	artifacts.write()
 	return envelope
 }
 
@@ -201,11 +205,11 @@ func (payload *Payload) ResolveEmpty() *engine.ExecutionPayloadEnvelope {
 // Don't call Resolve until ResolveFull returns, otherwise it might block forever.
 func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 	payload.lock.Lock()
-	defer payload.lock.Unlock()
 
 	if payload.full == nil {
 		select {
 		case <-payload.stop:
+			payload.lock.Unlock()
 			return nil
 		default:
 		}
@@ -220,61 +224,87 @@ func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 	default:
 		close(payload.stop)
 	}
-	payload.writeDependencyDOT()
-	payload.writeBenchmarkDelivery()
+	artifacts := payload.takeDeliveryArtifacts()
 	envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 	if payload.fullWitness != nil {
 		envelope.Witness = new(hexutil.Bytes)
 		*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 	}
+	payload.lock.Unlock()
+
+	// Delivery artifacts hit the disk; write them outside the lock so a slow
+	// write cannot stall engine_getPayload.
+	artifacts.write()
 	return envelope
 }
 
-func (payload *Payload) writeBenchmarkDelivery() {
-	if payload.benchmarkDelivered || payload.full == nil || payload.fullBenchmark == nil {
-		return
-	}
-	payload.fullBenchmark.recordDelivered(payload.full)
-	payload.benchmarkDelivered = true
+// deliveryArtifacts holds delivery-time side effects (JSONL benchmark events,
+// dependency DOT graphs) collected under payload.lock but written to disk
+// after the lock is released.
+type deliveryArtifacts struct {
+	id         engine.PayloadID
+	dependency *dependencyAnalyzer
+	benchmark  *buildBenchmarkAttempt
+	block      *types.Block
 }
 
-// writeDependencyDOT writes the graph for the payload selected for delivery.
-// The caller must hold payload.lock.
-func (payload *Payload) writeDependencyDOT() {
-	if payload.dependencyWritten {
-		return
+// takeDeliveryArtifacts collects the delivery-time side effects, marking them
+// as handled so repeated resolves do not write them twice. The caller must
+// hold payload.lock.
+func (payload *Payload) takeDeliveryArtifacts() *deliveryArtifacts {
+	artifacts := &deliveryArtifacts{id: payload.id}
+	if !payload.dependencyWritten {
+		dependency := payload.emptyDependency
+		if payload.full != nil {
+			dependency = payload.fullDependency
+		}
+		if dependency != nil && dependency.dotDir != "" {
+			artifacts.dependency = dependency
+			payload.dependencyWritten = true
+			payload.emptyDependency = nil
+			payload.fullDependency = nil
+		}
 	}
-	dependency := payload.emptyDependency
-	if payload.full != nil {
-		dependency = payload.fullDependency
+	if !payload.benchmarkDelivered && payload.full != nil && payload.fullBenchmark != nil {
+		artifacts.benchmark = payload.fullBenchmark
+		artifacts.block = payload.full
+		payload.benchmarkDelivered = true
 	}
-	if dependency == nil || dependency.dotDir == "" {
-		return
-	}
-	path, err := dependency.writeDOT(analyzeDependencies(dependency.transactions))
-	if err != nil {
-		log.Warn("Failed to write delivered payload dependency graph", "id", payload.id, "build", dependency.buildID, "err", err)
-		return
-	}
-	payload.dependencyWritten = true
-	payload.emptyDependency = nil
-	payload.fullDependency = nil
-	log.Info("Wrote delivered payload dependency graph",
-		"id", payload.id,
-		"build", dependency.buildID,
-		"number", dependency.blockNumber,
-		"file", path,
-	)
+	return artifacts
 }
 
-func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iteration int, payload *Payload, params *generateParams, witness bool) {
+// write emits the collected delivery artifacts. It performs file I/O and must
+// not be called with payload.lock held.
+func (artifacts *deliveryArtifacts) write() {
+	if artifacts == nil {
+		return
+	}
+	if artifacts.benchmark != nil {
+		artifacts.benchmark.recordDelivered(artifacts.block)
+	}
+	if dependency := artifacts.dependency; dependency != nil {
+		path, err := dependency.writeDOT(analyzeDependencies(dependency.transactions))
+		if err != nil {
+			log.Warn("Failed to write delivered payload dependency graph", "id", artifacts.id, "build", dependency.buildID, "err", err)
+			return
+		}
+		log.Info("Wrote delivered payload dependency graph",
+			"id", artifacts.id,
+			"build", dependency.buildID,
+			"number", dependency.blockNumber,
+			"file", path,
+		)
+	}
+}
+
+func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iteration int, strategy string, payload *Payload, params *generateParams, witness bool) {
 	ctx, span, spanEnd := telemetry.StartSpan(ctx, "miner.buildIteration",
 		telemetry.IntAttribute("iteration", iteration),
 	)
 	var err error
 	defer spanEnd(&err)
 
-	benchmark := miner.newBenchmarkAttempt(payload.id, iteration)
+	benchmark := miner.newBenchmarkAttempt(payload.id, iteration, strategy)
 	r := miner.generateWorkWithBenchmark(ctx, params, witness, benchmark)
 	elapsed := time.Since(start)
 	err = r.err
@@ -322,6 +352,8 @@ func (miner *Miner) buildPayload(ctx context.Context, args *BuildPayloadArgs, wi
 	}
 	// Construct a payload object for return.
 	payload := newPayload(empty.block, empty.requests, empty.witness, empty.dependency, payloadID)
+
+	benchmarkStrategy := miner.payloadBenchmarkStrategy()
 
 	// Spin up a routine for updating the payload in background. This strategy
 	// can maximum the revenue for including transactions with highest fee.
@@ -373,7 +405,7 @@ func (miner *Miner) buildPayload(ctx context.Context, args *BuildPayloadArgs, wi
 				}
 				start := time.Now()
 				iteration++
-				miner.runBuildIteration(bCtx, start, iteration, payload, fullParams, witness)
+				miner.runBuildIteration(bCtx, start, iteration, benchmarkStrategy, payload, fullParams, witness)
 				timer.Reset(max(0, miner.config.Recommit-time.Since(start)))
 			case <-payload.stop:
 				payload.updateSpanForDelivery(bSpan)
