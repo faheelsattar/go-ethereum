@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
@@ -65,47 +66,102 @@ type parallelSenderChain struct {
 }
 
 type parallelExecutionResult struct {
-	receipt         *types.Receipt
-	bal             *bal.ConstructionBlockAccessList
-	state           *state.ParallelStateResult
-	gas             core.GasPoolDelta
-	dependency      *transactionAccess
-	err             error
-	duration        time.Duration
-	stateCopy       time.Duration
-	resolveTime     time.Duration
-	resolveCount    int
-	resolveCacheHit bool
+	receipt    *types.Receipt
+	bal        *bal.ConstructionBlockAccessList
+	state      *state.ParallelStateResult
+	gas        core.GasPoolDelta
+	dependency *transactionAccess
+	err        error
+	duration   time.Duration
+	stateCopy  time.Duration
+}
+
+// parallelResolveEntry is a future for one transaction. The first caller to
+// request a hash performs the resolution and populates tx; concurrent callers
+// for the same hash block on done, which is closed once tx is set.
+type parallelResolveEntry struct {
+	done chan struct{}
+	tx   *types.Transaction
 }
 
 type parallelTransactionResolver struct {
-	mu           sync.Mutex
-	transactions map[common.Hash]*types.Transaction
+	mu      sync.Mutex
+	entries map[common.Hash]*parallelResolveEntry
+
+	work         time.Duration
+	blobWork     time.Duration
+	resolves     int
+	blobResolves int
+	cacheHits    int
 }
 
 func newParallelTransactionResolver() *parallelTransactionResolver {
-	return &parallelTransactionResolver{transactions: make(map[common.Hash]*types.Transaction)}
+	return &parallelTransactionResolver{entries: make(map[common.Hash]*parallelResolveEntry)}
 }
 
-func (r *parallelTransactionResolver) resolve(lazy *txpool.LazyTransaction) (*types.Transaction, bool, time.Duration) {
+// resolve returns the full transaction for lazy, resolving it at most once
+// across all callers. Blob resolution can be expensive, so its cost is tracked separately.
+func (r *parallelTransactionResolver) resolve(lazy *txpool.LazyTransaction, blob bool) *types.Transaction {
 	r.mu.Lock()
-	tx, ok := r.transactions[lazy.Hash]
-	r.mu.Unlock()
-	if ok {
-		return tx, true, 0
+	if entry, ok := r.entries[lazy.Hash]; ok {
+		r.cacheHits++
+		r.mu.Unlock()
+		<-entry.done
+		return entry.tx
 	}
+	entry := &parallelResolveEntry{done: make(chan struct{})}
+	r.entries[lazy.Hash] = entry
+	r.mu.Unlock()
+
 	started := time.Now()
-	tx = lazy.Resolve()
+	entry.tx = lazy.Resolve()
 	duration := time.Since(started)
+	close(entry.done)
+
 	r.mu.Lock()
-	if cached, exists := r.transactions[lazy.Hash]; exists {
-		tx = cached
-		ok = true
-	} else {
-		r.transactions[lazy.Hash] = tx
+	r.work += duration
+	r.resolves++
+	if blob {
+		r.blobWork += duration
+		r.blobResolves++
 	}
 	r.mu.Unlock()
-	return tx, ok, duration
+	return entry.tx
+}
+
+// parallelBlobPrefetchWorkers bounds the goroutines constructing blob cell
+// proofs, keeping that work off the evm execution workers.
+const parallelBlobPrefetchWorkers = 2
+
+func (r *parallelTransactionResolver) prefetchBlobTransactions(tasks []*parallelTask, interrupt *atomic.Int32) *sync.WaitGroup {
+	var blobs []*parallelTask
+	for _, task := range tasks {
+		if task.source == parallelBlobTx && task.tx == nil && !task.blobGasLimit {
+			blobs = append(blobs, task)
+		}
+	}
+	wg := new(sync.WaitGroup)
+	if len(blobs) == 0 {
+		return wg
+	}
+	var next atomic.Int64
+	for range min(parallelBlobPrefetchWorkers, len(blobs)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				if interrupt != nil && interrupt.Load() != commitInterruptNone {
+					return
+				}
+				index := int(next.Add(1)) - 1
+				if index >= len(blobs) {
+					return
+				}
+				r.resolve(blobs[index].lazy, true)
+			}
+		}()
+	}
+	return wg
 }
 
 type parallelBuildMetrics struct {
@@ -118,7 +174,6 @@ type parallelBuildMetrics struct {
 	retriedCommitted int
 	conflicts        int
 	retries          int
-	fallbacks        int
 	invalid          int
 	maxActiveWorkers int
 	executionWork    time.Duration
@@ -173,7 +228,6 @@ func (miner *Miner) parallelWorkerCount() int {
 	return max(1, min(workers, runtime.GOMAXPROCS(0)))
 }
 
-// todo: i dont know what the fuc is this lets revist this
 func parallelExecutionSupported(env *environment) (bool, string) {
 	if env.witness != nil {
 		return false, "stateless-witness"
@@ -211,21 +265,33 @@ func transactionSource(source parallelTxSource, plainTxs, blobTxs *txorder.Trans
 	return plainTxs
 }
 
+// parallelPlanningGasFactor scales the remaining block gas into a planning
+// budget of transaction gas limits. Transactions usually consume less than
+// their limit, so plan more than one block's worth; anything beyond the
+// budget waits for the next wave instead of being executed speculatively for
+// nothing.
+const parallelPlanningGasFactor = 2
+
 // planParallelTasks consumes copies of Geth's ordering queues, leaving the
-// originals untouched for ordered validation and commit.
-func planParallelTasks(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, availableBlobGas uint64) ([]*parallelTask, int) {
+// originals untouched for ordered validation and commit. Planning stops once
+// the cumulative gas limits of the planned transactions exceed gasBudget:
+// the pending queues can hold far more gas than fits in the block, and every
+// planned task costs a speculative execution.
+func planParallelTasks(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, availableBlobGas, gasBudget uint64) ([]*parallelTask, int) {
 	plainCopy, blobCopy := plainTxs.Copy(), blobTxs.Copy()
 	chains := make(map[common.Address]*parallelSenderChain)
 	lastTaskBySender := make(map[common.Address]*parallelTask)
 	var plannedBlobGas uint64
+	var plannedGas uint64
 	var tasks []*parallelTask
 
-	for {
+	for plannedGas < gasBudget {
 		// peek transaction by price
 		source, lazy, sender := peekParallelTransactionWithSender(plainCopy, blobCopy)
 		if lazy == nil {
 			break
 		}
+		plannedGas += lazy.Gas
 		// we now need to select the queue from which we will be removing
 		// the peeked transaction which we did above
 		selectedQueue := transactionSource(source, plainCopy, blobCopy)
@@ -279,10 +345,7 @@ func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, re
 	}
 	result := task.result
 	if task.tx == nil {
-		result.resolveCount = 1
-		tx, cached, duration := resolver.resolve(task.lazy)
-		result.resolveTime = duration
-		result.resolveCacheHit = cached
+		tx := resolver.resolve(task.lazy, task.source == parallelBlobTx)
 		if tx == nil {
 			result.err = errors.New("transaction is no longer available")
 			return
@@ -292,7 +355,15 @@ func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, re
 	chain := task.chain
 	if chain.state == nil {
 		started := time.Now()
-		chain.state = env.state.Copy()
+		// speculative view reads through env.state without copying it. This
+		// requires env.state to stay unmodified while workers run, which holds
+		// here: results are merged back only after the whole wave has finished.
+		speculative, err := env.state.Speculative()
+		if err != nil {
+			result.err = err
+			return
+		}
+		chain.state = speculative
 		chain.gas = env.gasPool.Snapshot()
 		chain.header = types.CopyHeader(env.header)
 		result.stateCopy = time.Since(started)
@@ -336,6 +407,33 @@ func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, re
 	chain.header.GasUsed = chain.gas.Used()
 }
 
+// runParallelTask executes one speculative task, converting a worker panic
+// into a failed, incomplete result. The speculative state is discarded and
+// the commit loop re-executes the transaction sequentially on the canonical
+// state, so a bug in the experimental executor degrades to sequential
+// behavior instead of crashing the node.
+func (miner *Miner) runParallelTask(env *environment, task *parallelTask, resolver *parallelTransactionResolver) {
+	defer func() {
+		if r := recover(); r != nil {
+			if task.result == nil {
+				task.result = new(parallelExecutionResult)
+			}
+			// clear the recorded state marks the result incomplete, which
+			// routes the transaction into the sequential re exec path.
+			task.result.state = nil
+			task.result.err = fmt.Errorf("speculative execution panic: %v", r)
+			log.Error("Optimistic transaction execution panicked",
+				"hash", task.lazy.Hash,
+				"sender", task.sender,
+				"position", task.position,
+				"err", r,
+				"stack", string(debug.Stack()),
+			)
+		}
+	}()
+	miner.executeParallelTask(env, task, resolver)
+}
+
 func insertParallelReadyTask(ready []*parallelTask, task *parallelTask) []*parallelTask {
 	index := sort.Search(len(ready), func(i int) bool {
 		return ready[i].position > task.position
@@ -368,7 +466,7 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 		go func() {
 			defer wg.Done()
 			for task := range jobs {
-				miner.executeParallelTask(env, task, resolver)
+				miner.runParallelTask(env, task, resolver)
 				done <- task
 			}
 		}()
@@ -398,15 +496,6 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 			metrics.speculative++
 			metrics.executionWork += task.result.duration
 			metrics.stateCopy += task.result.stateCopy
-			metrics.resolutionWork += task.result.resolveTime
-			metrics.resolveCount += task.result.resolveCount
-			if task.source == parallelBlobTx {
-				metrics.blobResolveWork += task.result.resolveTime
-				metrics.blobResolveCount += task.result.resolveCount
-			}
-			if task.result.resolveCacheHit {
-				metrics.resolveCacheHits++
-			}
 			if task.result.err == nil && task.next != nil && !interrupted {
 				ready = insertParallelReadyTask(ready, task.next)
 			}
@@ -422,16 +511,6 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 		}
 	}
 	return !interrupted
-}
-
-func (miner *Miner) retryParallelTask(env *environment, task *parallelTask) *parallelExecutionResult {
-	retry := &parallelTask{
-		tx:     task.tx,
-		sender: task.sender,
-		chain:  new(parallelSenderChain),
-	}
-	miner.executeParallelTask(env, retry, nil)
-	return retry.result
 }
 
 func parallelResultConflict(task *parallelTask, prior []parallelCommittedResult) *parallelConflict {
@@ -620,6 +699,11 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 	workers := miner.parallelWorkerCount()
 	resolver := newParallelTransactionResolver()
 	defer func() {
+		metrics.resolutionWork = resolver.work
+		metrics.blobResolveWork = resolver.blobWork
+		metrics.resolveCount = resolver.resolves
+		metrics.blobResolveCount = resolver.blobResolves
+		metrics.resolveCacheHits = resolver.cacheHits
 		if env.benchmark != nil {
 			env.benchmark.addParallelMetrics(metrics)
 		}
@@ -646,7 +730,6 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			"incompleteConflicts", metrics.incomplete,
 			"hotConflictLocations", topParallelConflictLocations(metrics.conflictHotspots, 5),
 			"retries", metrics.retries,
-			"fallbacks", metrics.fallbacks,
 			"invalid", metrics.invalid,
 			"sequentialErrors", metrics.sequentialErrors,
 			"wall", time.Since(metrics.started),
@@ -685,7 +768,12 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			availableBlobs := miner.maxBlobsPerBlock(env.header.Time) - env.blobs
 			availableBlobGas = uint64(availableBlobs) * params.BlobTxBlobGasPerBlob
 		}
-		tasks, chains := planParallelTasks(plainTxs, blobTxs, availableBlobGas)
+		// The wave must be sized before executing (no per-tx feedback like the
+		// sequential path). Cap it at ~one blocks worth so planning doesnt walk
+		// the whole pending pool executing transactions that cant fit, budgeted
+		// in gas limits, which run ~2x actual usage. Leftovers go to the next wave.
+		gasBudget := env.gasPool.Gas() * parallelPlanningGasFactor
+		tasks, chains := planParallelTasks(plainTxs, blobTxs, availableBlobGas, gasBudget)
 		metrics.planningTime += time.Since(planningStarted)
 		if len(tasks) == 0 {
 			break
@@ -693,7 +781,14 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		metrics.planned += len(tasks)
 		metrics.senderChains = max(metrics.senderChains, chains)
 		log.Debug("Executing optimistic transaction queue", "number", env.header.Number, "transactions", len(tasks), "senderChains", chains, "workers", workers)
-		if !miner.executeParallelTasks(env, tasks, workers, interrupt, resolver, metrics) {
+		// Resolve blob sidecars on dedicated goroutines with a
+		// a chance that it does not occupy the execution workers.
+		// in worst case if worker out runs the prefetcher it will resolve
+		// itself
+		blobPrefetch := resolver.prefetchBlobTransactions(tasks, interrupt)
+		executed := miner.executeParallelTasks(env, tasks, workers, interrupt, resolver, metrics)
+		blobPrefetch.Wait()
+		if !executed {
 			return signalToErr(interrupt.Load())
 		}
 
@@ -790,36 +885,28 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 					logParallelConflict(task, env.tcount, directConflict)
 					senderRetried[task.sender] = task
 				}
-				if miner.config.ParallelRetries > 0 {
-					started := time.Now()
-					task.result = miner.retryParallelTask(env, task)
-					duration := time.Since(started)
-					metrics.retryTime += duration
-					metrics.retries++
-					var retryErr error
-					if task.result != nil {
-						retryErr = task.result.err
-						metrics.executionWork += task.result.duration
-						metrics.stateCopy += task.result.stateCopy
-					}
-					log.Debug("Reexecuted optimistic transaction", "hash", task.tx.Hash(), "sender", task.sender, "position", task.position, "index", env.tcount, "duration", duration, "err", retryErr)
-				} else {
-					metrics.fallbacks++
-					env.state.SetTxContext(task.tx.Hash(), env.tcount, uint32(env.tcount+1))
-					env.state.StartParallelRecording()
-					err := miner.commitTransaction(ctx, env, task.tx)
-					sequentialState := env.state.FinishParallelRecording()
-					if err != nil {
+				started := time.Now()
+				env.state.SetTxContext(task.tx.Hash(), env.tcount, uint32(env.tcount+1))
+				env.state.StartParallelRecording()
+				err := miner.commitTransaction(ctx, env, task.tx)
+				sequentialState := env.state.FinishParallelRecording()
+				metrics.retryTime += time.Since(started)
+				metrics.retries++
+				if err != nil {
+					if errors.Is(err, core.ErrNonceTooLow) {
+						ordered.Shift()
+					} else {
 						ordered.Pop()
-						metrics.sequentialErrors++
-						restart = true
-						break
 					}
-					ordered.Shift()
-					metrics.committed++
-					prior = append(prior, parallelCommittedResult{hash: task.tx.Hash(), position: task.position, sender: task.sender, state: sequentialState})
-					continue
+					metrics.sequentialErrors++
+					restart = true
+					break
 				}
+				ordered.Shift()
+				metrics.committed++
+				metrics.retriedCommitted++
+				prior = append(prior, parallelCommittedResult{hash: task.tx.Hash(), position: task.position, sender: task.sender, state: sequentialState})
+				continue
 			}
 			if task.result == nil || task.result.err != nil {
 				err := errors.New("missing optimistic execution result")
@@ -846,11 +933,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			}
 			metrics.mergeTime += time.Since(mergeStart)
 			metrics.merged++
-			if conflict {
-				metrics.retriedCommitted++
-			} else {
-				metrics.firstAttempt++
-			}
+			metrics.firstAttempt++
 			metrics.committed++
 			ordered.Shift()
 			prior = append(prior, parallelCommittedResult{hash: task.tx.Hash(), position: task.position, sender: task.sender, state: task.result.state})
