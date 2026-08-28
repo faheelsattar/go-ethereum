@@ -14,7 +14,6 @@ import (
 
 const (
 	parallelBenchmarkOff       = "off"
-	parallelBenchmarkPaired    = "paired"
 	parallelBenchmarkAlternate = "alternate"
 
 	benchmarkStrategyParallel   = "parallel"
@@ -34,20 +33,19 @@ type buildBenchmarkAttempt struct {
 	strategy  string
 	recorder  *benchmarkRecorder
 	workers   int
+	noBlobs   bool
 
-	transactionWall         time.Duration
-	totalBuildWall          time.Duration
-	evmExecutionWork        time.Duration
-	resolutionWork          time.Duration
-	blobResolutionWork      time.Duration
-	sequentialWall          time.Duration
-	sequentialExecutionWork time.Duration
-	stateCopy               time.Duration
-	mergeTime               time.Duration
-	retryTime               time.Duration
-	planningTime            time.Duration
-	finalizationTime        time.Duration
-	termination             string
+	transactionWall    time.Duration
+	totalBuildWall     time.Duration
+	evmExecutionWork   time.Duration
+	resolutionWork     time.Duration
+	blobResolutionWork time.Duration
+	stateCopy          time.Duration
+	mergeTime          time.Duration
+	retryTime          time.Duration
+	planningTime       time.Duration
+	finalizationTime   time.Duration
+	termination        string
 
 	planned          int
 	senderChains     int
@@ -66,7 +64,6 @@ type buildBenchmarkAttempt struct {
 	existConflicts   int
 	incomplete       int
 	retries          int
-	fallbacks        int
 	invalid          int
 	sequentialErrors int
 	maxActiveWorkers int
@@ -74,10 +71,6 @@ type buildBenchmarkAttempt struct {
 	blobResolveCount int
 	resolveCacheHits int
 
-	txMatch      *bool
-	receiptMatch *bool
-	gasMatch     *bool
-	stateMatch   *bool
 }
 
 type benchmarkEvent struct {
@@ -97,54 +90,52 @@ type benchmarkEvent struct {
 	BlockNumber  uint64      `json:"blockNumber,omitempty"`
 	BlockHash    common.Hash `json:"blockHash,omitempty"`
 	ParentHash   common.Hash `json:"parentHash,omitempty"`
+	StateRoot    common.Hash `json:"stateRoot,omitempty"`
+	ReceiptsRoot common.Hash `json:"receiptsRoot,omitempty"`
 	Transactions int         `json:"transactions,omitempty"`
 	GasUsed      uint64      `json:"gasUsed,omitempty"`
 	BlockSize    uint64      `json:"blockSize,omitempty"`
 	Blobs        int         `json:"blobs,omitempty"`
+	NoBlobs      bool        `json:"noBlobs,omitempty"`
 
-	TotalBuildWallNs           int64 `json:"totalBuildWallNs,omitempty"`
-	TransactionExecutionWallNs int64 `json:"transactionExecutionWallNs,omitempty"`
-	EVMExecutionWorkNs         int64 `json:"evmExecutionWorkNs,omitempty"`
-	ResolutionWorkNs           int64 `json:"resolutionWorkNs,omitempty"`
-	BlobResolutionWorkNs       int64 `json:"blobResolutionWorkNs,omitempty"`
-	SequentialWallNs           int64 `json:"sequentialWallNs,omitempty"`
-	SequentialExecutionWorkNs  int64 `json:"sequentialExecutionWorkNs,omitempty"`
-	PlanningNs                 int64 `json:"planningNs,omitempty"`
-	StateCopyNs                int64 `json:"stateCopyNs,omitempty"`
-	MergeNs                    int64 `json:"mergeNs,omitempty"`
-	RetryNs                    int64 `json:"retryNs,omitempty"`
-	FinalizationNs             int64 `json:"finalizationNs,omitempty"`
+	// Metric fields are always emitted (no omitempty): a zero is data, and
+	// conditionally present fields make the JSONL painful to analyze.
+	TotalBuildWallNs           int64 `json:"totalBuildWallNs"`
+	TransactionExecutionWallNs int64 `json:"transactionExecutionWallNs"`
+	EVMExecutionWorkNs         int64 `json:"evmExecutionWorkNs"`
+	ResolutionWorkNs           int64 `json:"resolutionWorkNs"`
+	BlobResolutionWorkNs       int64 `json:"blobResolutionWorkNs"`
+	PlanningNs                 int64 `json:"planningNs"`
+	StateCopyNs                int64 `json:"stateCopyNs"`
+	MergeNs                    int64 `json:"mergeNs"`
+	RetryNs                    int64 `json:"retryNs"`
+	FinalizationNs             int64 `json:"finalizationNs"`
 
-	Workers                  int `json:"workers,omitempty"`
-	Planned                  int `json:"planned,omitempty"`
-	SenderChains             int `json:"senderChains,omitempty"`
-	MaxActiveWorkers         int `json:"maxActiveWorkers,omitempty"`
-	SpeculativeExecutions    int `json:"speculativeExecutions,omitempty"`
-	Committed                int `json:"committed,omitempty"`
-	Merged                   int `json:"merged,omitempty"`
-	FirstAttemptCommits      int `json:"firstAttemptCommits,omitempty"`
-	RetriedCommits           int `json:"retriedCommits,omitempty"`
-	Conflicts                int `json:"conflicts,omitempty"`
-	DirectConflicts          int `json:"directConflicts,omitempty"`
-	SenderChainInvalidations int `json:"senderChainInvalidations,omitempty"`
-	StorageConflicts         int `json:"storageConflicts,omitempty"`
-	BalanceConflicts         int `json:"balanceConflicts,omitempty"`
-	NonceConflicts           int `json:"nonceConflicts,omitempty"`
-	CodeConflicts            int `json:"codeConflicts,omitempty"`
-	ExistenceConflicts       int `json:"existenceConflicts,omitempty"`
-	IncompleteConflicts      int `json:"incompleteConflicts,omitempty"`
-	Retries                  int `json:"retries,omitempty"`
-	Fallbacks                int `json:"fallbacks,omitempty"`
-	Invalid                  int `json:"invalid,omitempty"`
-	SequentialErrors         int `json:"sequentialErrors,omitempty"`
-	ResolveCount             int `json:"resolveCount,omitempty"`
-	BlobResolveCount         int `json:"blobResolveCount,omitempty"`
-	ResolveCacheHits         int `json:"resolveCacheHits,omitempty"`
+	Workers                  int `json:"workers"`
+	Planned                  int `json:"planned"`
+	SenderChains             int `json:"senderChains"`
+	MaxActiveWorkers         int `json:"maxActiveWorkers"`
+	SpeculativeExecutions    int `json:"speculativeExecutions"`
+	Committed                int `json:"committed"`
+	Merged                   int `json:"merged"`
+	FirstAttemptCommits      int `json:"firstAttemptCommits"`
+	RetriedCommits           int `json:"retriedCommits"`
+	Conflicts                int `json:"conflicts"`
+	DirectConflicts          int `json:"directConflicts"`
+	SenderChainInvalidations int `json:"senderChainInvalidations"`
+	StorageConflicts         int `json:"storageConflicts"`
+	BalanceConflicts         int `json:"balanceConflicts"`
+	NonceConflicts           int `json:"nonceConflicts"`
+	CodeConflicts            int `json:"codeConflicts"`
+	ExistenceConflicts       int `json:"existenceConflicts"`
+	IncompleteConflicts      int `json:"incompleteConflicts"`
+	Retries                  int `json:"retries"`
+	Invalid                  int `json:"invalid"`
+	SequentialErrors         int `json:"sequentialErrors"`
+	ResolveCount             int `json:"resolveCount"`
+	BlobResolveCount         int `json:"blobResolveCount"`
+	ResolveCacheHits         int `json:"resolveCacheHits"`
 
-	TxMatch      *bool `json:"txMatch,omitempty"`
-	ReceiptMatch *bool `json:"receiptMatch,omitempty"`
-	GasMatch     *bool `json:"gasMatch,omitempty"`
-	StateMatch   *bool `json:"stateMatch,omitempty"`
 }
 
 func newBenchmarkRecorder(path string) *benchmarkRecorder {
@@ -172,20 +163,27 @@ func (r *benchmarkRecorder) write(event benchmarkEvent) {
 	}
 }
 
-func (miner *Miner) newBenchmarkAttempt(payloadID engine.PayloadID, iteration int) *buildBenchmarkAttempt {
+// payloadBenchmarkStrategy assigns the benchmark strategy for one payload.
+// The strategy is fixed per payload rather than per build iteration.
+func (miner *Miner) payloadBenchmarkStrategy() string {
+	if miner.config.ParallelBenchmarkMode != parallelBenchmarkAlternate {
+		return benchmarkStrategyParallel
+	}
+	// ABBA over payloads: sequential, parallel, parallel, sequential.
+	switch (miner.benchmarkPayloadCounter.Add(1) - 1) % 4 {
+	case 0, 3:
+		return benchmarkStrategySequential
+	default:
+		return benchmarkStrategyParallel
+	}
+}
+
+func (miner *Miner) newBenchmarkAttempt(payloadID engine.PayloadID, iteration int, strategy string) *buildBenchmarkAttempt {
 	mode := miner.config.ParallelBenchmarkMode
-	if mode != parallelBenchmarkPaired && mode != parallelBenchmarkAlternate {
+	if mode != parallelBenchmarkAlternate {
 		return nil
 	}
 	id := miner.benchmarkCounter.Add(1)
-	strategy := benchmarkStrategyParallel
-	if mode == parallelBenchmarkAlternate {
-		// ABBA: sequential, parallel, parallel, sequential.
-		switch (id - 1) % 4 {
-		case 0, 3:
-			strategy = benchmarkStrategySequential
-		}
-	}
 	return &buildBenchmarkAttempt{
 		id:        id,
 		payloadID: payloadID,
@@ -194,6 +192,7 @@ func (miner *Miner) newBenchmarkAttempt(payloadID engine.PayloadID, iteration in
 		strategy:  strategy,
 		recorder:  miner.benchmarkRecorder,
 		workers:   miner.parallelWorkerCount(),
+		noBlobs:   miner.config.ParallelBenchmarkNoBlobs,
 	}
 }
 
@@ -222,7 +221,6 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.existConflicts += metrics.existConflicts
 	attempt.incomplete += metrics.incomplete
 	attempt.retries += metrics.retries
-	attempt.fallbacks += metrics.fallbacks
 	attempt.invalid += metrics.invalid
 	attempt.sequentialErrors += metrics.sequentialErrors
 	attempt.maxActiveWorkers = max(attempt.maxActiveWorkers, metrics.maxActiveWorkers)
@@ -248,13 +246,12 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		Mode:                       attempt.mode,
 		Strategy:                   attempt.strategy,
 		Termination:                attempt.termination,
+		NoBlobs:                    attempt.noBlobs,
 		TransactionExecutionWallNs: attempt.transactionWall.Nanoseconds(),
 		TotalBuildWallNs:           attempt.totalBuildWall.Nanoseconds(),
 		EVMExecutionWorkNs:         attempt.evmExecutionWork.Nanoseconds(),
 		ResolutionWorkNs:           attempt.resolutionWork.Nanoseconds(),
 		BlobResolutionWorkNs:       attempt.blobResolutionWork.Nanoseconds(),
-		SequentialWallNs:           attempt.sequentialWall.Nanoseconds(),
-		SequentialExecutionWorkNs:  attempt.sequentialExecutionWork.Nanoseconds(),
 		PlanningNs:                 attempt.planningTime.Nanoseconds(),
 		StateCopyNs:                attempt.stateCopy.Nanoseconds(),
 		MergeNs:                    attempt.mergeTime.Nanoseconds(),
@@ -279,16 +276,11 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		ExistenceConflicts:         attempt.existConflicts,
 		IncompleteConflicts:        attempt.incomplete,
 		Retries:                    attempt.retries,
-		Fallbacks:                  attempt.fallbacks,
 		Invalid:                    attempt.invalid,
 		SequentialErrors:           attempt.sequentialErrors,
 		ResolveCount:               attempt.resolveCount,
 		BlobResolveCount:           attempt.blobResolveCount,
 		ResolveCacheHits:           attempt.resolveCacheHits,
-		TxMatch:                    attempt.txMatch,
-		ReceiptMatch:               attempt.receiptMatch,
-		GasMatch:                   attempt.gasMatch,
-		StateMatch:                 attempt.stateMatch,
 	}
 }
 
@@ -309,6 +301,8 @@ func (attempt *buildBenchmarkAttempt) recordCompleted(result *newPayloadResult, 
 	event.BlockNumber = result.block.NumberU64()
 	event.BlockHash = result.block.Hash()
 	event.ParentHash = result.block.ParentHash()
+	event.StateRoot = result.block.Root()
+	event.ReceiptsRoot = result.block.ReceiptHash()
 	event.Transactions = len(result.block.Transactions())
 	event.GasUsed = result.block.GasUsed()
 	event.BlockSize = result.block.Size()
@@ -320,6 +314,7 @@ func (attempt *buildBenchmarkAttempt) recordCompleted(result *newPayloadResult, 
 		"iteration", attempt.iteration,
 		"mode", attempt.mode,
 		"strategy", attempt.strategy,
+		"noBlobs", attempt.noBlobs,
 		"number", event.BlockNumber,
 		"transactions", event.Transactions,
 		"gasUsed", event.GasUsed,
@@ -346,10 +341,12 @@ func (attempt *buildBenchmarkAttempt) recordDelivered(block *types.Block) {
 	event.BlockNumber = block.NumberU64()
 	event.BlockHash = block.Hash()
 	event.ParentHash = block.ParentHash()
+	event.StateRoot = block.Root()
+	event.ReceiptsRoot = block.ReceiptHash()
 	event.Transactions = len(block.Transactions())
 	event.GasUsed = block.GasUsed()
 	event.BlockSize = block.Size()
 	event.Blobs = countBlockBlobs(block)
 	attempt.recorder.write(event)
-	log.Info("Block execution benchmark payload delivered", "attempt", attempt.id, "id", attempt.payloadID, "strategy", attempt.strategy, "number", event.BlockNumber, "transactions", event.Transactions)
+	log.Info("Block execution benchmark payload delivered", "attempt", attempt.id, "id", attempt.payloadID, "strategy", attempt.strategy, "noBlobs", attempt.noBlobs, "number", event.BlockNumber, "transactions", event.Transactions)
 }
