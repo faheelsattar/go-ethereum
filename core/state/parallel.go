@@ -114,6 +114,76 @@ func newParallelStateRecorder(preimages map[common.Hash][]byte) *parallelStateRe
 	}
 }
 
+// parallelBaseReader is a reader over a statedbs uncommitted block state,
+// falling back to its underlying reader. It reads the bases maps without
+// locks, so the base must stay unmodified while the reader is in use.
+type parallelBaseReader struct {
+	base *StateDB
+}
+
+func (r *parallelBaseReader) Account(addr common.Address) (*types.StateAccount, error) {
+	if obj := r.base.stateObjects[addr]; obj != nil {
+		return obj.data.Copy(), nil
+	}
+	// Accounts destructed in this block (and not resurrected) do not exist,
+	// regardless of what the disk state says.
+	if _, ok := r.base.stateObjectsDestruct[addr]; ok {
+		return nil, nil
+	}
+	return r.base.reader.Account(addr)
+}
+
+func (r *parallelBaseReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
+	if obj := r.base.stateObjects[addr]; obj != nil {
+		// Mirror stateObject.GetState: dirty (should be empty between
+		// transactions), then pending block writes, then the clean cache.
+		if value, ok := obj.dirtyStorage[slot]; ok {
+			return value, nil
+		}
+		if value, ok := obj.pendingStorage[slot]; ok {
+			return value, nil
+		}
+		if value, ok := obj.originStorage[slot]; ok {
+			return value, nil
+		}
+	}
+	// If the account was destructed in this block, its old storage must not
+	// be consulted: a resurrected account's live slots are all in
+	// pendingStorage, everything else reads as empty.
+	if _, ok := r.base.stateObjectsDestruct[addr]; ok {
+		return common.Hash{}, nil
+	}
+	return r.base.reader.Storage(addr, slot)
+}
+
+func (r *parallelBaseReader) Code(addr common.Address, codeHash common.Hash) []byte {
+	if obj := r.base.stateObjects[addr]; obj != nil && obj.code != nil && common.BytesToHash(obj.CodeHash()) == codeHash {
+		return obj.code
+	}
+	return r.base.reader.Code(addr, codeHash)
+}
+
+func (r *parallelBaseReader) CodeSize(addr common.Address, codeHash common.Hash) int {
+	if obj := r.base.stateObjects[addr]; obj != nil && obj.code != nil && common.BytesToHash(obj.CodeHash()) == codeHash {
+		return len(obj.code)
+	}
+	return r.base.reader.CodeSize(addr, codeHash)
+}
+
+func (r *parallelBaseReader) Has(addr common.Address, codeHash common.Hash) bool {
+	if obj := r.base.stateObjects[addr]; obj != nil && obj.code != nil && common.BytesToHash(obj.CodeHash()) == codeHash {
+		return true
+	}
+	return r.base.reader.Has(addr, codeHash)
+}
+
+// Speculative returns a fresh statedb reading through s's uncommitted block
+// state without copying it. s must stay unmodified while the returned state
+// is in use, and the result is throwaway: never commit it or compute roots.
+func (s *StateDB) Speculative() (*StateDB, error) {
+	return NewWithReader(s.originalRoot, s.db, &parallelBaseReader{base: s})
+}
+
 // StartParallelRecording enables transaction-local state access recording.
 // It must be called after SetTxContext and before executing the transaction.
 func (s *StateDB) StartParallelRecording() {
@@ -204,6 +274,7 @@ func (r *parallelStateRecorder) capture(s *StateDB) {
 		obj := s.stateObjects[addr]
 
 		if change.Created && !change.SelfDestructed && obj != nil && obj.empty() && !mutation.balanceSet && !mutation.nonceSet && !mutation.codeSet {
+			r.accesses.AccountReads[addr] |= ParallelAccountExistence
 			continue
 		}
 		if obj != nil && obj.empty() {

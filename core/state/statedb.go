@@ -363,6 +363,12 @@ func (s *StateDB) GetNonce(addr common.Address) uint64 {
 // Note: the storage root returned corresponds to the trie since last Intermediate
 // operation, some recent in-memory changes are excluded.
 func (s *StateDB) GetStorageRoot(addr common.Address) common.Hash {
+	// Note for parallel recording: a storage root depends on every slot of
+	// the account, which the per-slot recorder cannot express. Record a full
+	// account read as a conservative marker; if the EVM ever starts reading
+	// storage roots during execution, the recorder must be extended to flag
+	// conflicts against any storage write to this account.
+	s.recordAccountRead(addr, parallelAccountAll)
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.Root()

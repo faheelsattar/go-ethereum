@@ -624,7 +624,7 @@ var (
 	}
 	MinerParallelBenchmarkModeFlag = &cli.StringFlag{
 		Name:     "miner.parallel-benchmark-mode",
-		Usage:    "Parallel execution benchmark mode: off, paired, or alternate",
+		Usage:    "Parallel execution benchmark mode: off or alternate",
 		Value:    ethconfig.Defaults.Miner.ParallelBenchmarkMode,
 		Category: flags.MinerCategory,
 	}
@@ -633,16 +633,15 @@ var (
 		Usage:    "JSONL output file for parallel execution benchmark events",
 		Category: flags.MinerCategory,
 	}
+	MinerParallelBenchmarkNoBlobsFlag = &cli.BoolFlag{
+		Name:     "miner.parallel-benchmark-no-blobs",
+		Usage:    "Exclude blob transactions from parallel execution benchmark builds",
+		Category: flags.MinerCategory,
+	}
 	MinerParallelWorkersFlag = &cli.UintFlag{
 		Name:     "miner.parallel-workers",
 		Usage:    "Maximum optimistic transaction execution workers (capped by GOMAXPROCS)",
 		Value:    uint(ethconfig.Defaults.Miner.ParallelWorkers),
-		Category: flags.MinerCategory,
-	}
-	MinerParallelRetriesFlag = &cli.UintFlag{
-		Name:     "miner.parallel-retries",
-		Usage:    "Maximum optimistic conflict retries before sequential fallback",
-		Value:    uint(ethconfig.Defaults.Miner.ParallelRetries),
 		Category: flags.MinerCategory,
 	}
 
@@ -1774,24 +1773,31 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 		cfg.ParallelExecution = ctx.Bool(MinerParallelExecutionFlag.Name)
 	}
 	if ctx.IsSet(MinerParallelBenchmarkModeFlag.Name) {
-		cfg.ParallelBenchmarkMode = strings.ToLower(ctx.String(MinerParallelBenchmarkModeFlag.Name))
+		cfg.ParallelBenchmarkMode = ctx.String(MinerParallelBenchmarkModeFlag.Name)
 	}
+	// Normalize the mode regardless of whether it came from the CLI or a
+	// config file.
+	cfg.ParallelBenchmarkMode = strings.ToLower(cfg.ParallelBenchmarkMode)
 	switch cfg.ParallelBenchmarkMode {
 	case "", "off":
 		cfg.ParallelBenchmarkMode = "off"
-	case "paired", "alternate":
+	case "alternate":
+		if ctx.IsSet(MinerParallelExecutionFlag.Name) && !ctx.Bool(MinerParallelExecutionFlag.Name) {
+			log.Warn("Parallel benchmark mode overrides --miner.parallel-execution=false",
+				"mode", cfg.ParallelBenchmarkMode)
+		}
 		cfg.ParallelExecution = true
 	default:
-		Fatalf("--%s must be 'off', 'paired', or 'alternate'", MinerParallelBenchmarkModeFlag.Name)
+		Fatalf("--%s must be 'off' or 'alternate'", MinerParallelBenchmarkModeFlag.Name)
 	}
 	if ctx.IsSet(MinerParallelBenchmarkOutputFlag.Name) {
 		cfg.ParallelBenchmarkOutput = ctx.Path(MinerParallelBenchmarkOutputFlag.Name)
 	}
+	if ctx.IsSet(MinerParallelBenchmarkNoBlobsFlag.Name) {
+		cfg.ParallelBenchmarkNoBlobs = ctx.Bool(MinerParallelBenchmarkNoBlobsFlag.Name)
+	}
 	if ctx.IsSet(MinerParallelWorkersFlag.Name) {
 		cfg.ParallelWorkers = int(ctx.Uint(MinerParallelWorkersFlag.Name))
-	}
-	if ctx.IsSet(MinerParallelRetriesFlag.Name) {
-		cfg.ParallelRetries = int(ctx.Uint(MinerParallelRetriesFlag.Name))
 	}
 }
 
