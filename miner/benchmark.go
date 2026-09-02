@@ -37,9 +37,12 @@ type buildBenchmarkAttempt struct {
 
 	transactionWall    time.Duration
 	totalBuildWall     time.Duration
+	executeWall        time.Duration
+	commitWall         time.Duration
 	evmExecutionWork   time.Duration
 	resolutionWork     time.Duration
 	blobResolutionWork time.Duration
+	resolveWait        time.Duration
 	stateCopy          time.Duration
 	mergeTime          time.Duration
 	retryTime          time.Duration
@@ -47,6 +50,7 @@ type buildBenchmarkAttempt struct {
 	finalizationTime   time.Duration
 	termination        string
 
+	waves            int
 	planned          int
 	senderChains     int
 	speculative      int
@@ -64,6 +68,8 @@ type buildBenchmarkAttempt struct {
 	existConflicts   int
 	incomplete       int
 	retries          int
+	retryRounds      int
+	retryExecutions  int
 	invalid          int
 	sequentialErrors int
 	maxActiveWorkers int
@@ -95,16 +101,19 @@ type benchmarkEvent struct {
 	Transactions int         `json:"transactions,omitempty"`
 	GasUsed      uint64      `json:"gasUsed,omitempty"`
 	BlockSize    uint64      `json:"blockSize,omitempty"`
-	Blobs        int         `json:"blobs,omitempty"`
+	Blobs        int         `json:"blobs"`
 	NoBlobs      bool        `json:"noBlobs,omitempty"`
 
 	// Metric fields are always emitted (no omitempty): a zero is data, and
 	// conditionally present fields make the JSONL painful to analyze.
 	TotalBuildWallNs           int64 `json:"totalBuildWallNs"`
 	TransactionExecutionWallNs int64 `json:"transactionExecutionWallNs"`
+	ExecuteWallNs              int64 `json:"executeWallNs"`
+	CommitWallNs               int64 `json:"commitWallNs"`
 	EVMExecutionWorkNs         int64 `json:"evmExecutionWorkNs"`
 	ResolutionWorkNs           int64 `json:"resolutionWorkNs"`
 	BlobResolutionWorkNs       int64 `json:"blobResolutionWorkNs"`
+	ResolveWaitNs              int64 `json:"resolveWaitNs"`
 	PlanningNs                 int64 `json:"planningNs"`
 	StateCopyNs                int64 `json:"stateCopyNs"`
 	MergeNs                    int64 `json:"mergeNs"`
@@ -112,6 +121,7 @@ type benchmarkEvent struct {
 	FinalizationNs             int64 `json:"finalizationNs"`
 
 	Workers                  int `json:"workers"`
+	Waves                    int `json:"waves"`
 	Planned                  int `json:"planned"`
 	SenderChains             int `json:"senderChains"`
 	MaxActiveWorkers         int `json:"maxActiveWorkers"`
@@ -130,6 +140,8 @@ type benchmarkEvent struct {
 	ExistenceConflicts       int `json:"existenceConflicts"`
 	IncompleteConflicts      int `json:"incompleteConflicts"`
 	Retries                  int `json:"retries"`
+	RetryRounds              int `json:"retryRounds"`
+	RetryExecutions          int `json:"retryExecutions"`
 	Invalid                  int `json:"invalid"`
 	SequentialErrors         int `json:"sequentialErrors"`
 	ResolveCount             int `json:"resolveCount"`
@@ -204,6 +216,7 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	if attempt == nil {
 		return
 	}
+	attempt.waves += metrics.waves
 	attempt.planned += metrics.planned
 	attempt.senderChains = max(attempt.senderChains, metrics.senderChains)
 	attempt.speculative += metrics.speculative
@@ -221,12 +234,17 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.existConflicts += metrics.existConflicts
 	attempt.incomplete += metrics.incomplete
 	attempt.retries += metrics.retries
+	attempt.retryRounds += metrics.retryRounds
+	attempt.retryExecutions += metrics.retryExecutions
 	attempt.invalid += metrics.invalid
 	attempt.sequentialErrors += metrics.sequentialErrors
 	attempt.maxActiveWorkers = max(attempt.maxActiveWorkers, metrics.maxActiveWorkers)
 	attempt.evmExecutionWork += metrics.executionWork
+	attempt.executeWall += metrics.executeWall
+	attempt.commitWall += metrics.commitWall
 	attempt.resolutionWork += metrics.resolutionWork
 	attempt.blobResolutionWork += metrics.blobResolveWork
+	attempt.resolveWait += metrics.resolveWait
 	attempt.stateCopy += metrics.stateCopy
 	attempt.mergeTime += metrics.mergeTime
 	attempt.retryTime += metrics.retryTime
@@ -249,15 +267,19 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		NoBlobs:                    attempt.noBlobs,
 		TransactionExecutionWallNs: attempt.transactionWall.Nanoseconds(),
 		TotalBuildWallNs:           attempt.totalBuildWall.Nanoseconds(),
+		ExecuteWallNs:              attempt.executeWall.Nanoseconds(),
+		CommitWallNs:               attempt.commitWall.Nanoseconds(),
 		EVMExecutionWorkNs:         attempt.evmExecutionWork.Nanoseconds(),
 		ResolutionWorkNs:           attempt.resolutionWork.Nanoseconds(),
 		BlobResolutionWorkNs:       attempt.blobResolutionWork.Nanoseconds(),
+		ResolveWaitNs:              attempt.resolveWait.Nanoseconds(),
 		PlanningNs:                 attempt.planningTime.Nanoseconds(),
 		StateCopyNs:                attempt.stateCopy.Nanoseconds(),
 		MergeNs:                    attempt.mergeTime.Nanoseconds(),
 		RetryNs:                    attempt.retryTime.Nanoseconds(),
 		FinalizationNs:             attempt.finalizationTime.Nanoseconds(),
 		Workers:                    attempt.workers,
+		Waves:                      attempt.waves,
 		Planned:                    attempt.planned,
 		SenderChains:               attempt.senderChains,
 		MaxActiveWorkers:           attempt.maxActiveWorkers,
@@ -276,6 +298,8 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		ExistenceConflicts:         attempt.existConflicts,
 		IncompleteConflicts:        attempt.incomplete,
 		Retries:                    attempt.retries,
+		RetryRounds:                attempt.retryRounds,
+		RetryExecutions:            attempt.retryExecutions,
 		Invalid:                    attempt.invalid,
 		SequentialErrors:           attempt.sequentialErrors,
 		ResolveCount:               attempt.resolveCount,
@@ -338,6 +362,8 @@ func (attempt *buildBenchmarkAttempt) recordDelivered(block *types.Block) {
 	event := attempt.event("payload_delivered")
 	event.Completed = true
 	event.Delivered = true
+	accepted := true // a delivered payload is by definition the accepted best
+	event.Accepted = &accepted
 	event.BlockNumber = block.NumberU64()
 	event.BlockHash = block.Hash()
 	event.ParentHash = block.ParentHash()
