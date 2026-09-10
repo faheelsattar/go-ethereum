@@ -44,15 +44,20 @@ type Backend interface {
 
 // Config is the configuration parameters of mining.
 type Config struct {
-	Etherbase           common.Address `toml:"-"`          // Deprecated
-	PendingFeeRecipient common.Address `toml:"-"`          // Address for pending block rewards.
-	ExtraData           hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
-	GasCeil             uint64         // Target gas ceiling for mined blocks.
-	GasPrice            *big.Int       // Minimum gas price for mining a transaction
-	Recommit            time.Duration  // The time interval for miner to re-create mining work.
-	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
-	ParallelExecution   bool           // Execute transactions optimistically with a shared worker pool.
-	ParallelWorkers     int            // Maximum optimistic execution workers.
+	Etherbase                common.Address `toml:"-"`          // Deprecated
+	PendingFeeRecipient      common.Address `toml:"-"`          // Address for pending block rewards.
+	ExtraData                hexutil.Bytes  `toml:",omitempty"` // Block extra data set by the miner
+	GasCeil                  uint64         // Target gas ceiling for mined blocks.
+	GasPrice                 *big.Int       // Minimum gas price for mining a transaction
+	Recommit                 time.Duration  // The time interval for miner to re-create mining work.
+	MaxBlobsPerBlock         int            // Maximum number of blobs per block (0 for unset uses protocol default)
+	DependencyAnalysis       bool           // Log transaction storage access and dependency metrics during block construction.
+	DependencyDotDir         string         // Directory for transaction dependency graph DOT files.
+	ParallelExecution        bool           // Execute transactions optimistically with a shared worker pool.
+	ParallelBenchmarkMode    string         // Parallel execution benchmark mode: off or alternate.
+	ParallelBenchmarkOutput  string         // JSONL output file for parallel execution benchmark events.
+	ParallelBenchmarkNoBlobs bool           // Exclude blob transactions from parallel benchmark builds.
+	ParallelWorkers          int            // Maximum optimistic execution workers.
 }
 
 // DefaultConfig contains default settings for miner.
@@ -60,7 +65,8 @@ var DefaultConfig = Config{
 	GasCeil:  60_000_000,
 	GasPrice: big.NewInt(params.GWei / 1000),
 
-	ParallelWorkers: 8,
+	ParallelWorkers:       8,
+	ParallelBenchmarkMode: parallelBenchmarkOff,
 
 	// The default recommit time is chosen as two seconds since
 	// consensus-layer usually will wait a half slot of time(6s)
@@ -82,6 +88,10 @@ type Miner struct {
 	pending     *pending
 	pendingMu   sync.Mutex // Lock protects the pending block
 
+	benchmarkCounter        atomic.Uint64
+	benchmarkPayloadCounter atomic.Uint64
+	benchmarkRecorder       *benchmarkRecorder
+
 	// lastParallelMetrics holds the metrics of the most recent parallel commit
 	// phase. It exists so tests can inspect the executor's behavior.
 	lastParallelMetrics atomic.Pointer[parallelBuildMetrics]
@@ -90,12 +100,13 @@ type Miner struct {
 // New creates a new miner with provided config.
 func New(eth Backend, config Config, engine consensus.Engine) *Miner {
 	return &Miner{
-		config:      &config,
-		chainConfig: eth.BlockChain().Config(),
-		engine:      engine,
-		txpool:      eth.TxPool(),
-		chain:       eth.BlockChain(),
-		pending:     &pending{},
+		config:            &config,
+		chainConfig:       eth.BlockChain().Config(),
+		engine:            engine,
+		txpool:            eth.TxPool(),
+		chain:             eth.BlockChain(),
+		pending:           &pending{},
+		benchmarkRecorder: newBenchmarkRecorder(config.ParallelBenchmarkOutput),
 	}
 }
 

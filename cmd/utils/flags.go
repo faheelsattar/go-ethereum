@@ -607,9 +607,35 @@ var (
 		Usage:    "Maximum number of blobs per block (falls back to protocol maximum if unspecified)",
 		Category: flags.MinerCategory,
 	}
+	MinerDependencyAnalysisFlag = &cli.BoolFlag{
+		Name:     "miner.dependency-analysis",
+		Usage:    "Log transaction storage accesses and dependency metrics during block construction",
+		Category: flags.MinerCategory,
+	}
+	MinerDependencyDotDirFlag = &cli.PathFlag{
+		Name:     "miner.dependency-dotdir",
+		Usage:    "Directory for delivered payload transaction dependency graph DOT files (enables dependency analysis)",
+		Category: flags.MinerCategory,
+	}
 	MinerParallelExecutionFlag = &cli.BoolFlag{
 		Name:     "miner.parallel-execution",
 		Usage:    "Execute transactions optimistically with a shared worker pool during block construction",
+		Category: flags.MinerCategory,
+	}
+	MinerParallelBenchmarkModeFlag = &cli.StringFlag{
+		Name:     "miner.parallel-benchmark-mode",
+		Usage:    "Parallel execution benchmark mode: off or alternate",
+		Value:    ethconfig.Defaults.Miner.ParallelBenchmarkMode,
+		Category: flags.MinerCategory,
+	}
+	MinerParallelBenchmarkOutputFlag = &cli.PathFlag{
+		Name:     "miner.parallel-benchmark-output",
+		Usage:    "JSONL output file for parallel execution benchmark events",
+		Category: flags.MinerCategory,
+	}
+	MinerParallelBenchmarkNoBlobsFlag = &cli.BoolFlag{
+		Name:     "miner.parallel-benchmark-no-blobs",
+		Usage:    "Exclude blob transactions from parallel execution benchmark builds",
 		Category: flags.MinerCategory,
 	}
 	MinerParallelWorkersFlag = &cli.UintFlag{
@@ -1734,8 +1760,41 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	if ctx.IsSet(MinerMaxBlobsFlag.Name) {
 		cfg.MaxBlobsPerBlock = ctx.Int(MinerMaxBlobsFlag.Name)
 	}
+	if ctx.IsSet(MinerDependencyAnalysisFlag.Name) {
+		cfg.DependencyAnalysis = ctx.Bool(MinerDependencyAnalysisFlag.Name)
+	}
+	if ctx.IsSet(MinerDependencyDotDirFlag.Name) {
+		cfg.DependencyDotDir = ctx.Path(MinerDependencyDotDirFlag.Name)
+		if cfg.DependencyDotDir != "" {
+			cfg.DependencyAnalysis = true
+		}
+	}
 	if ctx.IsSet(MinerParallelExecutionFlag.Name) {
 		cfg.ParallelExecution = ctx.Bool(MinerParallelExecutionFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelBenchmarkModeFlag.Name) {
+		cfg.ParallelBenchmarkMode = ctx.String(MinerParallelBenchmarkModeFlag.Name)
+	}
+	// Normalize the mode regardless of whether it came from the CLI or a
+	// config file.
+	cfg.ParallelBenchmarkMode = strings.ToLower(cfg.ParallelBenchmarkMode)
+	switch cfg.ParallelBenchmarkMode {
+	case "", "off":
+		cfg.ParallelBenchmarkMode = "off"
+	case "alternate":
+		if ctx.IsSet(MinerParallelExecutionFlag.Name) && !ctx.Bool(MinerParallelExecutionFlag.Name) {
+			log.Warn("Parallel benchmark mode overrides --miner.parallel-execution=false",
+				"mode", cfg.ParallelBenchmarkMode)
+		}
+		cfg.ParallelExecution = true
+	default:
+		Fatalf("--%s must be 'off' or 'alternate'", MinerParallelBenchmarkModeFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelBenchmarkOutputFlag.Name) {
+		cfg.ParallelBenchmarkOutput = ctx.Path(MinerParallelBenchmarkOutputFlag.Name)
+	}
+	if ctx.IsSet(MinerParallelBenchmarkNoBlobsFlag.Name) {
+		cfg.ParallelBenchmarkNoBlobs = ctx.Bool(MinerParallelBenchmarkNoBlobsFlag.Name)
 	}
 	if ctx.IsSet(MinerParallelWorkersFlag.Name) {
 		cfg.ParallelWorkers = int(ctx.Uint(MinerParallelWorkersFlag.Name))
