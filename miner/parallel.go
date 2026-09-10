@@ -48,32 +48,38 @@ type parallelTask struct {
 	lazy         *txpool.LazyTransaction
 	tx           *types.Transaction
 	sender       common.Address
-	chain        *parallelSenderChain
 	previous     *parallelTask
 	next         *parallelTask
 	result       *parallelExecutionResult
 	blobGasLimit bool
 	blobGasLeft  uint64
 
+	// The chain this task runs on: its shared execution context and the
+	// task's link index in it. Every earlier link's writes were visible to
+	// this task's execution, so they are inputs, not conflicts.
+	contextForChain *speculativeContextForChain
+	indexInChain    int
+
 	// Retry bookkeeping. settled tasks need no further processing; retried
 	// tasks have been re-executed at least once; conflictKey remembers where
-	// the last conflict happened so retry waves can chain contenders.
+	// the last conflict happened so retry rounds can chain contenders.
 	settled     bool
 	retried     bool
 	conflictKey *parallelConflictLocation
 
-	// What the latest execution could see, for validation: every result
-	// committed before priorBase, plus every earlier link of the chain it ran
-	// on (execChain/execIndex). Those writes are inputs, not conflicts.
-	priorBase int
-	execChain *parallelSenderChain
-	execIndex int
+	// How many results had been committed to the block state when this
+	// task's latest execution started. Those results were part of the state
+	// it read, so they are inputs, not conflicts.
+	commitsSeen int
 }
 
-// parallelSenderChain carries speculative state between nonce-dependent
-// transactions. It is never owned by a worker and has at most one runnable
-// task, so workers can safely hand it off through the shared queue.
-type parallelSenderChain struct {
+// speculativeContextForChain is the execution context shared by a chain of
+// tasks linked through parallelTask.previous/next: the speculative state each
+// task runs on top of the previous one's writes, the gas pool that accumulates
+// across them, and a private header copy since execution mutates GasUsed. At
+// most one task on a chain is runnable at a time, so no worker ever contends
+// for it.
+type speculativeContextForChain struct {
 	state  *state.StateDB
 	gas    *core.GasPool
 	header *types.Header
@@ -192,7 +198,7 @@ func (r *parallelTransactionResolver) prefetchBlobTransactions(tasks []*parallel
 
 type parallelBuildMetrics struct {
 	started          time.Time
-	waves            int
+	batches          int
 	planned          int
 	senderChains     int
 	speculative      int
@@ -300,7 +306,7 @@ func transactionSource(source parallelTxSource, plainTxs, blobTxs *txorder.Trans
 // parallelPlanningGasFactor scales the remaining block gas into a planning
 // budget of transaction gas limits. Transactions usually consume less than
 // their limit, so plan more than one block's worth; anything beyond the
-// budget waits for the next wave instead of being executed speculatively for
+// budget waits for the next batch instead of being executed speculatively for
 // nothing.
 const parallelPlanningGasFactor = 2
 
@@ -311,7 +317,7 @@ const parallelPlanningGasFactor = 2
 // planned task costs a speculative execution.
 func planParallelTasks(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, availableBlobGas, gasBudget uint64) ([]*parallelTask, int) {
 	plainCopy, blobCopy := plainTxs.Copy(), blobTxs.Copy()
-	chains := make(map[common.Address]*parallelSenderChain)
+	chains := make(map[common.Address]*speculativeContextForChain)
 	lastTaskBySender := make(map[common.Address]*parallelTask)
 	var plannedBlobGas uint64
 	var plannedGas uint64
@@ -346,23 +352,22 @@ func planParallelTasks(plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, a
 		}
 		chain := chains[sender]
 		if chain == nil {
-			chain = new(parallelSenderChain)
+			chain = new(speculativeContextForChain)
 			chains[sender] = chain
 		}
 		task := &parallelTask{
-			position:  len(tasks),
-			source:    source,
-			lazy:      lazy,
-			sender:    sender,
-			chain:     chain,
-			execChain: chain,
+			position:        len(tasks),
+			source:          source,
+			lazy:            lazy,
+			sender:          sender,
+			contextForChain: chain,
 		}
 		// create the same sender nonce dependency links
 		if previous := lastTaskBySender[sender]; previous != nil {
 			// A0 -> A1 -> A2
 			previous.next = task
 			task.previous = previous
-			task.execIndex = previous.execIndex + 1
+			task.indexInChain = previous.indexInChain + 1
 		}
 		lastTaskBySender[sender] = task
 		tasks = append(tasks, task)
@@ -386,12 +391,12 @@ func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, re
 		}
 		task.tx = tx
 	}
-	chain := task.chain
+	chain := task.contextForChain
 	if chain.state == nil {
 		started := time.Now()
 		// speculative view reads through env.state without copying it. This
 		// requires env.state to stay unmodified while workers run, which holds
-		// here: results are merged back only after the whole wave has finished.
+		// here: results are merged back only after the whole batch has finished.
 		speculative, err := env.state.Speculative()
 		if err != nil {
 			result.err = err
@@ -482,16 +487,16 @@ func insertParallelReadyTask(ready []*parallelTask, task *parallelTask) []*paral
 // completing a task releases its same-sender successor back to the shared
 // ready queue, where any worker may pick it up.
 func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask, workers int, interrupt *atomic.Int32, resolver *parallelTransactionResolver, metrics *parallelBuildMetrics) bool {
-	var ready []*parallelTask
+	var readyTasks []*parallelTask
 	for _, task := range tasks {
-		if task.chain != nil && task.previous == nil {
-			ready = insertParallelReadyTask(ready, task)
+		if task.contextForChain != nil && task.previous == nil {
+			readyTasks = insertParallelReadyTask(readyTasks, task)
 		}
 	}
-	if len(ready) == 0 {
+	if len(readyTasks) == 0 {
 		return true
 	}
-	workers = min(workers, len(ready))
+	workers = min(workers, len(readyTasks))
 	jobs := make(chan *parallelTask)
 	done := make(chan *parallelTask)
 	var wg sync.WaitGroup
@@ -508,57 +513,63 @@ func (miner *Miner) executeParallelTasks(env *environment, tasks []*parallelTask
 
 	active := 0
 	interrupted := false
-	for len(ready) > 0 || active > 0 {
+	for len(readyTasks) > 0 || active > 0 {
 		if interrupt != nil && interrupt.Load() != commitInterruptNone {
 			interrupted = true
-			ready = nil
+			readyTasks = nil
 		}
-		var (
-			out  chan *parallelTask
-			next *parallelTask
-		)
-		if !interrupted && len(ready) > 0 {
-			out, next = jobs, ready[0]
-		}
-		select {
-		case out <- next:
-			ready = ready[1:]
-			active++
-			metrics.maxActiveWorkers = max(metrics.maxActiveWorkers, active)
-		case task := <-done:
-			active--
-			metrics.speculative++
-			metrics.executionWork += task.result.duration
-			metrics.stateCopy += task.result.stateCopy
-			if task.result.err == nil && task.next != nil && !interrupted {
-				ready = insertParallelReadyTask(ready, task.next)
+		var task *parallelTask
+		if len(readyTasks) == 0 {
+			// nothing to run rightnow, wait for a worker to finish.
+			task = <-done
+		} else {
+			// hand  the lowest position ready task to the first free worker,
+			// or collect a finished task if every worker is still busy.
+			select {
+			case jobs <- readyTasks[0]:
+				readyTasks = readyTasks[1:]
+				active++
+				metrics.maxActiveWorkers = max(metrics.maxActiveWorkers, active)
+				continue
+			case task = <-done:
 			}
+		}
+		// a task finshed, record it, and release its same sender successor
+		// into the ready queue, where any free worker may pick it up.
+		active--
+		metrics.speculative++
+		metrics.executionWork += task.result.duration
+		metrics.stateCopy += task.result.stateCopy
+		if task.result.err == nil && task.next != nil && !interrupted {
+			readyTasks = insertParallelReadyTask(readyTasks, task.next)
 		}
 	}
 	close(jobs)
 	wg.Wait()
 	for _, task := range tasks {
-		if task.chain != nil {
-			task.chain.state = nil
-			task.chain.gas = nil
-			task.chain.header = nil
+		if task.contextForChain != nil {
+			task.contextForChain.state = nil
+			task.contextForChain.gas = nil
+			task.contextForChain.header = nil
 		}
 	}
 	return !interrupted
 }
 
-func parallelResultConflict(task *parallelTask, prior []parallelCommittedResult) *parallelConflict {
+func parallelResultConflict(task *parallelTask, committedResults []parallelCommittedResult) *parallelConflict {
 	if task.result == nil || task.result.state == nil {
 		return &parallelConflict{incomplete: true}
 	}
-	for i := task.priorBase; i < len(prior); i++ {
-		committed := prior[i]
+	// Results committed before this execution ran were part of the state it
+	// read, so only the ones committed after it can conflict.
+	for i := task.commitsSeen; i < len(committedResults); i++ {
+		committed := committedResults[i]
 		if committed.sender == task.sender {
 			continue
 		}
 		// Writes of an earlier link of the task's own chain were visible to
 		// its execution; they are inputs, not conflicts.
-		if task.execChain != nil && committed.chain == task.execChain && committed.chainIndex < task.execIndex {
+		if task.contextForChain != nil && committed.chain == task.contextForChain && committed.chainIndex < task.indexInChain {
 			continue
 		}
 		if conflict := task.result.state.Conflict(committed.state); conflict != nil {
@@ -577,7 +588,7 @@ type parallelCommittedResult struct {
 	position   int
 	sender     common.Address
 	state      *state.ParallelStateResult
-	chain      *parallelSenderChain // chain the committed execution ran on, if any
+	chain      *speculativeContextForChain // chain the committed execution ran on, if any
 	chainIndex int
 }
 
@@ -587,8 +598,8 @@ func committedResult(task *parallelTask, result *state.ParallelStateResult) para
 		position:   task.position,
 		sender:     task.sender,
 		state:      result,
-		chain:      task.execChain,
-		chainIndex: task.execIndex,
+		chain:      task.contextForChain,
+		chainIndex: task.indexInChain,
 	}
 }
 
@@ -748,30 +759,30 @@ func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTas
 	return nil
 }
 
-// parallelMaxRetryRounds bounds how many parallel retry waves a block wave
+// parallelMaxRetryRounds bounds how many parallel retry rounds a batch
 // may run before the remaining conflicts fall back to serial re-execution on
 // the commit goroutine, which guarantees termination.
 const parallelMaxRetryRounds = 3
 
-// parallelRetryChain tracks one retry chain while a retry wave is assembled.
+// parallelRetryChain tracks one retry chain while a retry round is assembled.
 type parallelRetryChain struct {
-	chain *parallelSenderChain
+	chain *speculativeContextForChain
 	tail  *parallelTask
 }
 
-// buildParallelRetryWave rewires the stale tasks into a retry wave. Tasks are
+// chainStaleTasks rewires the stale tasks into a retry round. Tasks are
 // chained when they must (same sender: nonce order) or should (same conflict
-// location: contenders on one slot re-execute serially within the wave,
+// location: contenders on one slot re-execute serially within the batch,
 // seeing each other's writes, so a hot slot converges in one round instead of
 // one round per transaction). Independent chains run on separate workers.
 // It returns the number of chains.
-func buildParallelRetryWave(retry []*parallelTask) int {
+func chainStaleTasks(staleTasks []*parallelTask) int {
 	var (
 		bySender   = make(map[common.Address]*parallelRetryChain)
 		byLocation = make(map[parallelConflictLocation]*parallelRetryChain)
 		chains     int
 	)
-	for _, task := range retry {
+	for _, task := range staleTasks {
 		task.result = nil
 		task.retried = true
 		task.previous, task.next = nil, nil
@@ -783,16 +794,15 @@ func buildParallelRetryWave(retry []*parallelTask) int {
 			group = byLocation[*task.conflictKey]
 		}
 		if group == nil {
-			group = &parallelRetryChain{chain: new(parallelSenderChain)}
+			group = &parallelRetryChain{chain: new(speculativeContextForChain)}
 			chains++
 		}
-		task.chain = group.chain
-		task.execChain = group.chain
-		task.execIndex = 0
+		task.contextForChain = group.chain
+		task.indexInChain = 0
 		if group.tail != nil {
 			group.tail.next = task
 			task.previous = group.tail
-			task.execIndex = group.tail.execIndex + 1
+			task.indexInChain = group.tail.indexInChain + 1
 		}
 		group.tail = task
 		bySender[task.sender] = group
@@ -803,11 +813,11 @@ func buildParallelRetryWave(retry []*parallelTask) int {
 	return chains
 }
 
-// parallelWaveCommit carries the ordered-commit state of one wave across its
+// parallelBatchCommit carries the ordered-commit state of one batch across its
 // retry rounds.
-type parallelWaveCommit struct {
-	prior         []parallelCommittedResult
-	poppedSenders map[common.Address]bool
+type parallelBatchCommit struct {
+	committed     []parallelCommittedResult // footprints of every merged result, in commit order
+	poppedSenders map[common.Address]bool   // senders removed from the queues; their remaining tasks are skipped
 }
 
 // commitTransactionsParallel takes the normal, and blob txs and determines how we can
@@ -831,7 +841,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			"build", parallelDependencyBuildID(env.dependency),
 			"number", env.header.Number,
 			"workers", workers,
-			"waves", metrics.waves,
+			"batches", metrics.batches,
 			"planned", metrics.planned,
 			"senderChains", metrics.senderChains,
 			"maxActiveWorkers", metrics.maxActiveWorkers,
@@ -894,17 +904,17 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			availableBlobs := miner.maxBlobsPerBlock(env.header.Time) - env.blobs
 			availableBlobGas = uint64(availableBlobs) * params.BlobTxBlobGasPerBlob
 		}
-		// The wave must be sized before executing (no per-tx feedback like the
+		// The batch must be sized before executing (no per-tx feedback like the
 		// sequential path). Cap it at ~one blocks worth so planning doesnt walk
 		// the whole pending pool executing transactions that cant fit, budgeted
-		// in gas limits, which run ~2x actual usage. Leftovers go to the next wave.
+		// in gas limits, which run ~2x actual usage. Leftovers go to the next batch.
 		gasBudget := env.gasPool.Gas() * parallelPlanningGasFactor
 		tasks, chains := planParallelTasks(plainTxs, blobTxs, availableBlobGas, gasBudget)
 		metrics.planningTime += time.Since(planningStarted)
 		if len(tasks) == 0 {
 			break
 		}
-		metrics.waves++
+		metrics.batches++
 		metrics.planned += len(tasks)
 		metrics.senderChains = max(metrics.senderChains, chains)
 		log.Debug("Executing optimistic transaction queue", "number", env.header.Number, "transactions", len(tasks), "senderChains", chains, "workers", workers)
@@ -920,45 +930,49 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		if !executed {
 			return signalToErr(interrupt.Load())
 		}
-		// Ordered commit with parallel retry rounds: each pass merges the
-		// longest valid prefix in queue order, the stale tasks it collected
-		// re-execute as a parallel retry wave against the advanced block
-		// state, and the commit pass runs again. After parallelMaxRetryRounds
-		// the remaining conflicts re-execute inline on the commit goroutine,
-		// which always makes progress.
-		wave := &parallelWaveCommit{poppedSenders: make(map[common.Address]bool)}
-		var restart bool
+		// Commit the batch in queue order, one round at a time. A round commits
+		// tasks until it reaches the first one whose result is stale, then
+		// returns that task and every later task already known to be stale.
+		// Those are re-executed on the workers against the block state as it
+		// now stands, and the next round tries to commit again. After
+		// parallelMaxRetryRounds, stale tasks are instead re-executed one by one
+		// on this goroutine as the walk reaches them, which always completes
+		// the batch.
+		batch := &parallelBatchCommit{poppedSenders: make(map[common.Address]bool)}
+		var someTxOrderChanged bool
 		for round := 0; ; round++ {
-			serialRetries := round >= parallelMaxRetryRounds
+			inlineFallback := round >= parallelMaxRetryRounds
 			commitStarted := time.Now()
-			retry, r, done, err := miner.commitParallelTasks(ctx, env, tasks, plainTxs, blobTxs, wave, serialRetries, interrupt, metrics)
+			staleTasks, changed, blockFull, err := miner.commitParallelTasks(ctx, env, tasks, plainTxs, blobTxs, batch, inlineFallback, interrupt, metrics)
 			metrics.commitWall += time.Since(commitStarted)
 			if err != nil {
 				return err
 			}
-			if done {
+			if blockFull {
 				return nil
 			}
-			restart = r
-			if restart || len(retry) == 0 {
+			someTxOrderChanged = changed
+			if someTxOrderChanged || len(staleTasks) == 0 {
 				break
 			}
 			metrics.retryRounds++
-			metrics.retryExecutions += len(retry)
-			buildParallelRetryWave(retry)
-			// The retry executes against the block state as of now: every
-			// result committed so far is an input, not a conflict candidate.
-			for _, task := range retry {
-				task.priorBase = len(wave.prior)
+			metrics.retryExecutions += len(staleTasks)
+			chainStaleTasks(staleTasks)
+			// The stale tasks re-execute against the block state as of now, so
+			// every result committed so far is an input, not a conflict candidate.
+			for _, task := range staleTasks {
+				task.commitsSeen = len(batch.committed)
 			}
 			retryStarted := time.Now()
-			executed := miner.executeParallelTasks(env, retry, workers, interrupt, resolver, metrics)
+			executed := miner.executeParallelTasks(env, staleTasks, workers, interrupt, resolver, metrics)
 			metrics.executeWall += time.Since(retryStarted)
 			if !executed {
 				return signalToErr(interrupt.Load())
 			}
 		}
-		if restart {
+		if someTxOrderChanged {
+			// The real queue no longer matches the plan; plan a new batch from
+			// wherever the queues now stand.
 			continue
 		}
 	}
@@ -1008,40 +1022,44 @@ func (miner *Miner) checkTaskViable(env *environment, task *parallelTask, candid
 }
 
 // commitParallelTasks is the commit stage of the pipeline. It walks the
-// wave's tasks in queue order and merges results until it finds a stale one:
+// batch's tasks in queue order and merges results until it finds a stale one:
 // a result invalidated by a conflict, a broken sender chain, or a dropped
 // input. From there it stops consuming the queue — preserving block order —
 // and only collects the tasks already known stale, which the caller
-// re-executes as the next retry wave. With serialRetries set (the terminal
+// re-executes as the next retry round. With inlineFallback set (the terminal
 // mode), stale tasks re-execute inline on the canonical state instead, which
-// always finishes the wave. done reports that the block is full.
-func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, tasks []*parallelTask, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, wave *parallelWaveCommit, serialRetries bool, interrupt *atomic.Int32, metrics *parallelBuildMetrics) (retry []*parallelTask, restart, done bool, err error) {
+// always finishes the batch.
+//
+// It returns the stale tasks to re-execute, whether the real queue diverged
+// from the plan (someTxOrderChanged: the caller must replan), and whether the block
+// is full (blockFull: the caller must stop building).
+func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, tasks []*parallelTask, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, batch *parallelBatchCommit, inlineFallback bool, interrupt *atomic.Int32, metrics *parallelBuildMetrics) (stale []*parallelTask, someTxOrderChanged, blockFull bool, err error) {
 	var (
 		merging = true
-		// brokenSenders holds senders whose chain went stale mid-wave: their
+		// brokenSenders holds senders whose chain went stale mid-batch: their
 		// later transactions must re-execute regardless of their results.
 		brokenSenders = make(map[common.Address]*parallelTask)
 		// droppedChains records, per execution chain, the lowest link whose
 		// result did not commit in this pass. Later links of that chain
 		// speculated on the dropped writes and must re-execute.
-		droppedChains = make(map[*parallelSenderChain]int)
+		droppedChains = make(map[*speculativeContextForChain]int)
 	)
 	sawDroppedWrite := func(task *parallelTask) bool {
-		index, ok := droppedChains[task.execChain]
-		return ok && task.execIndex > index
+		index, ok := droppedChains[task.contextForChain]
+		return ok && task.indexInChain > index
 	}
 	drop := func(task *parallelTask) {
-		if index, ok := droppedChains[task.execChain]; !ok || task.execIndex < index {
-			droppedChains[task.execChain] = task.execIndex
+		if index, ok := droppedChains[task.contextForChain]; !ok || task.indexInChain < index {
+			droppedChains[task.contextForChain] = task.indexInChain
 		}
 	}
 	pop := func(task *parallelTask, ordered *txorder.TransactionsByPriceAndNonce) {
 		ordered.Pop()
-		wave.poppedSenders[task.sender] = true
+		batch.poppedSenders[task.sender] = true
 		drop(task)
 		metrics.invalid++
 	}
-	// collect queues a stale task for the next retry wave and stops the
+	// collect queues a stale task for the next retry round and stops the
 	// merge: later tasks can only be gathered, never committed, so the block
 	// order stays intact.
 	collect := func(task *parallelTask, conflict *parallelConflict) {
@@ -1059,7 +1077,7 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 		}
 		brokenSenders[task.sender] = task
 		drop(task)
-		retry = append(retry, task)
+		stale = append(stale, task)
 		merging = false
 	}
 
@@ -1072,7 +1090,7 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 		if task.settled {
 			continue
 		}
-		if wave.poppedSenders[task.sender] {
+		if batch.poppedSenders[task.sender] {
 			// Not in the queue anymore and never committing: anything that
 			// speculated on its writes must re-execute.
 			drop(task)
@@ -1091,7 +1109,7 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 			if task.previous != nil && !task.previous.settled {
 				continue // depends on a pending task; re-executing now would be premature
 			}
-			if conflict := parallelResultConflict(task, wave.prior); conflict != nil && conflict.state != nil && !conflict.incomplete {
+			if conflict := parallelResultConflict(task, batch.committed); conflict != nil && conflict.state != nil && !conflict.incomplete {
 				collect(task, conflict)
 			}
 			continue
@@ -1124,14 +1142,14 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 		droppedInput := sawDroppedWrite(task)
 		var conflict *parallelConflict
 		if !senderBroken && !droppedInput {
-			conflict = parallelResultConflict(task, wave.prior)
+			conflict = parallelResultConflict(task, batch.committed)
 		}
 		if senderBroken || droppedInput || conflict != nil {
-			if !serialRetries {
+			if !inlineFallback {
 				collect(task, conflict)
 				continue
 			}
-			miner.commitTaskSerially(ctx, env, task, ordered, wave, brokenSenders, drop, invalidating, conflict, metrics)
+			miner.commitTaskSerially(ctx, env, task, ordered, batch, brokenSenders, drop, invalidating, conflict, metrics)
 			continue
 		}
 		if task.result.err != nil {
@@ -1145,11 +1163,11 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 				drop(task)
 				ordered.Shift()
 				brokenSenders[task.sender] = task
-				if !serialRetries {
+				if !inlineFallback {
 					merging = false
 				}
 				metrics.invalid++
-			} else if !serialRetries && !task.retried {
+			} else if !inlineFallback && !task.retried {
 				// The failure may be an artifact of stale speculative inputs;
 				// give the transaction one fresh re-execution before dropping
 				// its sender.
@@ -1175,15 +1193,15 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 		metrics.committed++
 		task.settled = true
 		ordered.Shift()
-		wave.prior = append(wave.prior, committedResult(task, task.result.state))
+		batch.committed = append(batch.committed, committedResult(task, task.result.state))
 	}
-	return retry, false, false, nil
+	return stale, false, false, nil
 }
 
 // commitTaskSerially re-executes one stale transaction inline on the
 // canonical block state. This is in commit order, so the fresh result cannot
 // be stale and commits (or drops the sender) immediately.
-func (miner *Miner) commitTaskSerially(ctx context.Context, env *environment, task *parallelTask, ordered *txorder.TransactionsByPriceAndNonce, wave *parallelWaveCommit, brokenSenders map[common.Address]*parallelTask, drop func(*parallelTask), invalidating *parallelTask, conflict *parallelConflict, metrics *parallelBuildMetrics) {
+func (miner *Miner) commitTaskSerially(ctx context.Context, env *environment, task *parallelTask, ordered *txorder.TransactionsByPriceAndNonce, batch *parallelBatchCommit, brokenSenders map[common.Address]*parallelTask, drop func(*parallelTask), invalidating *parallelTask, conflict *parallelConflict, metrics *parallelBuildMetrics) {
 	metrics.conflicts++
 	switch {
 	case invalidating != nil:
@@ -1218,7 +1236,7 @@ func (miner *Miner) commitTaskSerially(ctx context.Context, env *environment, ta
 			ordered.Shift()
 		} else {
 			ordered.Pop()
-			wave.poppedSenders[task.sender] = true
+			batch.poppedSenders[task.sender] = true
 			metrics.invalid++
 		}
 		return
@@ -1232,5 +1250,5 @@ func (miner *Miner) commitTaskSerially(ctx context.Context, env *environment, ta
 	// skip validating against it.
 	entry := committedResult(task, sequentialState)
 	entry.chain, entry.chainIndex = nil, 0
-	wave.prior = append(wave.prior, entry)
+	batch.committed = append(batch.committed, entry)
 }

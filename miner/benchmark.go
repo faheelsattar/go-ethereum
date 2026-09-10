@@ -50,7 +50,7 @@ type buildBenchmarkAttempt struct {
 	finalizationTime   time.Duration
 	termination        string
 
-	waves            int
+	batches          int
 	planned          int
 	senderChains     int
 	speculative      int
@@ -76,7 +76,6 @@ type buildBenchmarkAttempt struct {
 	resolveCount     int
 	blobResolveCount int
 	resolveCacheHits int
-
 }
 
 type benchmarkEvent struct {
@@ -121,7 +120,7 @@ type benchmarkEvent struct {
 	FinalizationNs             int64 `json:"finalizationNs"`
 
 	Workers                  int `json:"workers"`
-	Waves                    int `json:"waves"`
+	Batches                  int `json:"batches"`
 	Planned                  int `json:"planned"`
 	SenderChains             int `json:"senderChains"`
 	MaxActiveWorkers         int `json:"maxActiveWorkers"`
@@ -147,7 +146,6 @@ type benchmarkEvent struct {
 	ResolveCount             int `json:"resolveCount"`
 	BlobResolveCount         int `json:"blobResolveCount"`
 	ResolveCacheHits         int `json:"resolveCacheHits"`
-
 }
 
 func newBenchmarkRecorder(path string) *benchmarkRecorder {
@@ -216,7 +214,7 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	if attempt == nil {
 		return
 	}
-	attempt.waves += metrics.waves
+	attempt.batches += metrics.batches
 	attempt.planned += metrics.planned
 	attempt.senderChains = max(attempt.senderChains, metrics.senderChains)
 	attempt.speculative += metrics.speculative
@@ -279,7 +277,7 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		RetryNs:                    attempt.retryTime.Nanoseconds(),
 		FinalizationNs:             attempt.finalizationTime.Nanoseconds(),
 		Workers:                    attempt.workers,
-		Waves:                      attempt.waves,
+		Batches:                    attempt.batches,
 		Planned:                    attempt.planned,
 		SenderChains:               attempt.senderChains,
 		MaxActiveWorkers:           attempt.maxActiveWorkers,
