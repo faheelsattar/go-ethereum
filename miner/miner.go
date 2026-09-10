@@ -91,6 +91,10 @@ type Miner struct {
 	benchmarkCounter        atomic.Uint64
 	benchmarkPayloadCounter atomic.Uint64
 	benchmarkRecorder       *benchmarkRecorder
+
+	// lastParallelMetrics holds the metrics of the most recent parallel commit
+	// phase. It exists so tests can inspect the executor's behavior.
+	lastParallelMetrics atomic.Pointer[parallelBuildMetrics]
 }
 
 // New creates a new miner with provided config.

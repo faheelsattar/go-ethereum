@@ -837,6 +837,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		if env.benchmark != nil {
 			env.benchmark.addParallelMetrics(metrics)
 		}
+		miner.lastParallelMetrics.Store(metrics)
 		log.Info("Parallel block execution summary",
 			"build", parallelDependencyBuildID(env.dependency),
 			"number", env.header.Number,
