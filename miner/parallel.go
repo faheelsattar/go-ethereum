@@ -86,14 +86,13 @@ type speculativeContextForChain struct {
 }
 
 type parallelExecutionResult struct {
-	receipt    *types.Receipt
-	bal        *bal.ConstructionBlockAccessList
-	state      *state.ParallelStateResult
-	gas        core.GasPoolDelta
-	dependency *transactionAccess
-	err        error
-	duration   time.Duration
-	stateCopy  time.Duration
+	receipt   *types.Receipt
+	bal       *bal.ConstructionBlockAccessList
+	state     *state.ParallelStateResult
+	gas       core.GasPoolDelta
+	err       error
+	duration  time.Duration
+	stateCopy time.Duration
 }
 
 // parallelResolveEntry is a future for one transaction. The first caller to
@@ -251,13 +250,6 @@ type parallelConflict struct {
 	incomplete       bool
 }
 
-func parallelDependencyBuildID(dependency *dependencyAnalyzer) uint64 {
-	if dependency == nil {
-		return 0
-	}
-	return dependency.buildID
-}
-
 func (miner *Miner) parallelWorkerCount() int {
 	workers := miner.config.ParallelWorkers
 	if workers <= 0 {
@@ -408,40 +400,23 @@ func (miner *Miner) executeParallelTask(env *environment, task *parallelTask, re
 		result.stateCopy = time.Since(started)
 	}
 
-	var analyzer *dependencyAnalyzer
-	vmConfig := vm.Config{}
-	if env.dependency != nil {
-		analyzer = newDependencyAnalyzer(0, chain.header, chain.state, "")
-		analyzer.silent = true
-		vmConfig.Tracer = analyzer.hooks()
-	}
-	evm := vm.NewEVM(core.NewEVMBlockContext(chain.header, miner.chain, &env.coinbase), chain.state, miner.chainConfig, vmConfig)
+	evm := vm.NewEVM(core.NewEVMBlockContext(chain.header, miner.chain, &env.coinbase), chain.state, miner.chainConfig, vm.Config{})
 	defer evm.Release()
 
 	index := env.tcount + task.position
 	chain.state.SetTxContext(task.tx.Hash(), index, uint32(index+1))
 	chain.state.StartParallelRecording()
 	gasBefore := chain.gas.Snapshot()
-	if analyzer != nil {
-		analyzer.beginTransaction(task.tx, task.sender, index, 0)
-	}
 	started := time.Now()
 	result.receipt, result.bal, result.err = core.ApplyTransaction(evm, chain.gas, chain.state, chain.header, task.tx)
 	result.duration = time.Since(started)
 	result.state = chain.state.FinishParallelRecording()
 	if result.err != nil {
-		if analyzer != nil {
-			analyzer.abortTransaction()
-		}
 		return
 	}
 	result.gas, result.err = chain.gas.TransactionDelta(gasBefore)
 	if result.err != nil {
 		return
-	}
-	if analyzer != nil {
-		analyzer.finishTransaction(result.receipt, result.duration)
-		result.dependency = analyzer.transactions[len(analyzer.transactions)-1]
 	}
 	chain.header.GasUsed = chain.gas.Used()
 }
@@ -715,7 +690,7 @@ func topParallelConflictLocations(locations map[parallelConflictLocation]int, li
 	return result
 }
 
-func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTask, candidateRank uint64) error {
+func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTask) error {
 	result := task.result
 	if result == nil || result.err != nil || result.state == nil || result.receipt == nil {
 		return errors.New("incomplete optimistic transaction result")
@@ -752,9 +727,6 @@ func (miner *Miner) mergeParallelTransaction(env *environment, task *parallelTas
 	}
 	env.receipts = append(env.receipts, result.receipt)
 	env.bal.Merge(result.bal)
-	if env.dependency != nil {
-		env.dependency.commitParallelTransaction(result.dependency, env.tcount, candidateRank)
-	}
 	env.tcount++
 	return nil
 }
@@ -834,12 +806,8 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		metrics.resolveCount = resolver.resolves
 		metrics.blobResolveCount = resolver.blobResolves
 		metrics.resolveCacheHits = resolver.cacheHits
-		if env.benchmark != nil {
-			env.benchmark.addParallelMetrics(metrics)
-		}
 		miner.lastParallelMetrics.Store(metrics)
 		log.Info("Parallel block execution summary",
-			"build", parallelDependencyBuildID(env.dependency),
 			"number", env.header.Number,
 			"workers", workers,
 			"batches", metrics.batches,
@@ -991,12 +959,9 @@ const (
 // checkTaskViable applies the per-transaction inclusion checks the sequential
 // builder also performs: blob budget, remaining gas, replay protection and
 // block size.
-func (miner *Miner) checkTaskViable(env *environment, task *parallelTask, candidateRank uint64) parallelTaskVerdict {
+func (miner *Miner) checkTaskViable(env *environment, task *parallelTask) parallelTaskVerdict {
 	if task.blobGasLimit {
 		log.Trace("Not enough blob space left for transaction", "hash", task.lazy.Hash, "left", task.blobGasLeft/params.BlobTxBlobGasPerBlob, "needed", task.lazy.BlobGas/params.BlobTxBlobGasPerBlob)
-		if env.dependency != nil {
-			env.dependency.logCandidate(candidateRank, task.lazy.Hash, "skipped", "blob-gas-limit", nil)
-		}
 		return taskNotViable
 	}
 	if task.tx == nil {
@@ -1124,12 +1089,7 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 			return nil, true, false, nil
 		}
 		ordered := transactionSource(task.source, plainTxs, blobTxs)
-		candidateRank := uint64(0)
-		if env.dependency != nil {
-			candidateRank = env.dependency.nextCandidate()
-			env.candidateRank = candidateRank
-		}
-		switch miner.checkTaskViable(env, task, candidateRank) {
+		switch miner.checkTaskViable(env, task) {
 		case taskNotViable:
 			pop(task, ordered)
 			continue
@@ -1179,7 +1139,7 @@ func (miner *Miner) commitParallelTasks(ctx context.Context, env *environment, t
 			continue
 		}
 		mergeStart := time.Now()
-		if err := miner.mergeParallelTransaction(env, task, candidateRank); err != nil {
+		if err := miner.mergeParallelTransaction(env, task); err != nil {
 			log.Debug("Optimistic result merge failed", "hash", task.tx.Hash(), "err", err)
 			pop(task, ordered)
 			continue
