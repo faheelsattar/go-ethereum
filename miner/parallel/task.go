@@ -236,4 +236,39 @@ func (r *Result) Apply(sdb *state.StateDB, coinbase common.Address) {
 		sdb.AddPreimage(h, p)
 	}
 	sdb.Finalise(true)
+	r.fixAccessList(sdb, coinbase)
+}
+
+// TODO: a little hacky, patching the lists maps after the fact.
+// Better done through dedicated methods on ConstructionBlockAccessList.
+func (r *Result) fixAccessList(sdb *state.StateDB, coinbase common.Address) {
+	if r.AccessList == nil {
+		return
+	}
+
+	index := uint32(sdb.TxIndex() + 1)
+	for _, acc := range r.AccessList.Accounts {
+		for _, writes := range acc.StorageWrites {
+			reIndex(writes, index)
+		}
+		reIndex(acc.BalanceChanges, index)
+		reIndex(acc.NonceChanges, index)
+		reIndex(acc.CodeChange, index)
+	}
+	if r.fee == nil {
+		return
+	}
+	if acc := r.AccessList.Accounts[coinbase]; acc != nil && len(acc.BalanceChanges) > 0 {
+		acc.BalanceChanges[index] = sdb.GetBalance(coinbase).Clone()
+	}
+}
+
+// reIndex moves the entries of a single txs change map to index.
+func reIndex[V any](changes map[uint32]V, index uint32) {
+	for from, v := range changes {
+		if from != index {
+			delete(changes, from)
+			changes[index] = v
+		}
+	}
 }
