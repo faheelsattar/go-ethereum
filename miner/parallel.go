@@ -105,6 +105,9 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		metrics.Stats = engine.Stats()
 		metrics.wall = time.Since(started)
 		miner.lastParallelMetrics.Store(metrics)
+		if env.benchmark != nil {
+			env.benchmark.addParallelMetrics(metrics)
+		}
 		if err != nil && !(errors.Is(err, errBlockInterruptedByNewHead) || errors.Is(err, errBlockInterruptedByRecommit) || errors.Is(err, errBlockInterruptedByTimeout)) {
 			log.Warn("Parallel block building failed", "number", env.header.Number, "err", err)
 		}

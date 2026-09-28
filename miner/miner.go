@@ -53,6 +53,10 @@ type Config struct {
 	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
 	ParallelExecution   bool           // Execute transactions optimistically with a shared worker pool.
 	ParallelWorkers     int            // Maximum optimistic execution workers.
+
+	ParallelBenchmarkMode    string // Parallel execution benchmark mode: off or alternate.
+	ParallelBenchmarkOutput  string // JSONL output file for parallel execution benchmark events.
+	ParallelBenchmarkNoBlobs bool   // Exclude blob transactions from parallel benchmark builds.
 }
 
 // DefaultConfig contains default settings for miner.
@@ -60,7 +64,8 @@ var DefaultConfig = Config{
 	GasCeil:  60_000_000,
 	GasPrice: big.NewInt(params.GWei / 1000),
 
-	ParallelWorkers: 8,
+	ParallelWorkers:       8,
+	ParallelBenchmarkMode: parallelBenchmarkOff,
 
 	// The default recommit time is chosen as two seconds since
 	// consensus-layer usually will wait a half slot of time(6s)
@@ -85,17 +90,22 @@ type Miner struct {
 	// lastParallelMetrics holds the metrics of the most recent parallel commit
 	// phase. It exists so tests can inspect the executor's behavior.
 	lastParallelMetrics atomic.Pointer[parallelBuildMetrics]
+
+	benchmarkCounter        atomic.Uint64
+	benchmarkPayloadCounter atomic.Uint64
+	benchmarkRecorder       *benchmarkRecorder
 }
 
 // New creates a new miner with provided config.
 func New(eth Backend, config Config, engine consensus.Engine) *Miner {
 	return &Miner{
-		config:      &config,
-		chainConfig: eth.BlockChain().Config(),
-		engine:      engine,
-		txpool:      eth.TxPool(),
-		chain:       eth.BlockChain(),
-		pending:     &pending{},
+		config:            &config,
+		chainConfig:       eth.BlockChain().Config(),
+		engine:            engine,
+		txpool:            eth.TxPool(),
+		chain:             eth.BlockChain(),
+		pending:           &pending{},
+		benchmarkRecorder: newBenchmarkRecorder(config.ParallelBenchmarkOutput),
 	}
 }
 

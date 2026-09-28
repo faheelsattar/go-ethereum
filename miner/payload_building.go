@@ -97,6 +97,9 @@ type Payload struct {
 	stop          chan struct{}
 	lock          sync.Mutex
 	cond          *sync.Cond
+
+	fullBenchmark      *buildBenchmarkAttempt // measurements of the build that produced full
+	benchmarkDelivered bool                   // whether the delivery event has been recorded
 }
 
 // newPayload initializes the payload object.
@@ -136,6 +139,7 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 		payload.sidecars = r.sidecars
 		payload.requests = r.requests
 		payload.fullWitness = r.witness
+		payload.fullBenchmark = r.benchmark
 
 		var (
 			attrs       []any
@@ -158,6 +162,9 @@ func (payload *Payload) update(r *newPayloadResult, elapsed time.Duration) (resu
 		log.Info("Updated payload", attrs...)
 		result = true
 	}
+	if r.benchmark != nil {
+		r.benchmark.recordCompleted(r, elapsed, result)
+	}
 	payload.cond.Broadcast() // fire signal for notifying full block
 	return
 }
@@ -176,27 +183,46 @@ func (payload *Payload) FullBlockAndReceipts() (*types.Block, []*types.Receipt, 
 // thread for updating payload. It's safe to be called multiple times.
 func (payload *Payload) Resolve() *engine.ExecutionPayloadEnvelope {
 	payload.lock.Lock()
-	defer payload.lock.Unlock()
 
 	select {
 	case <-payload.stop:
 	default:
 		close(payload.stop)
 	}
+	benchmark, delivered := payload.takeBenchmarkDelivery()
+	var envelope *engine.ExecutionPayloadEnvelope
 	if payload.full != nil {
-		envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
+		envelope = engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 		if payload.fullWitness != nil {
 			envelope.Witness = new(hexutil.Bytes)
 			*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 		}
-		return envelope
+	} else {
+		envelope = engine.BlockToExecutableData(payload.empty, big.NewInt(0), nil, payload.emptyRequests)
+		if payload.emptyWitness != nil {
+			envelope.Witness = new(hexutil.Bytes)
+			*envelope.Witness, _ = rlp.EncodeToBytes(payload.emptyWitness) // cannot fail
+		}
 	}
-	envelope := engine.BlockToExecutableData(payload.empty, big.NewInt(0), nil, payload.emptyRequests)
-	if payload.emptyWitness != nil {
-		envelope.Witness = new(hexutil.Bytes)
-		*envelope.Witness, _ = rlp.EncodeToBytes(payload.emptyWitness) // cannot fail
+	payload.lock.Unlock()
+
+	// The delivery event hits the disk; record it outside the lock so a slow
+	// write cannot stall engine_getPayload.
+	if benchmark != nil {
+		benchmark.recordDelivered(delivered)
 	}
 	return envelope
+}
+
+// takeBenchmarkDelivery returns the benchmark of the delivered full block the
+// first time it is called, so repeated resolves record the delivery once. The
+// caller must hold payload.lock.
+func (payload *Payload) takeBenchmarkDelivery() (*buildBenchmarkAttempt, *types.Block) {
+	if payload.benchmarkDelivered || payload.full == nil || payload.fullBenchmark == nil {
+		return nil, nil
+	}
+	payload.benchmarkDelivered = true
+	return payload.fullBenchmark, payload.full
 }
 
 // ResolveEmpty is basically identical to Resolve, but it expects empty block only.
@@ -217,11 +243,11 @@ func (payload *Payload) ResolveEmpty() *engine.ExecutionPayloadEnvelope {
 // Don't call Resolve until ResolveFull returns, otherwise it might block forever.
 func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 	payload.lock.Lock()
-	defer payload.lock.Unlock()
 
 	if payload.full == nil {
 		select {
 		case <-payload.stop:
+			payload.lock.Unlock()
 			return nil
 		default:
 		}
@@ -236,27 +262,38 @@ func (payload *Payload) ResolveFull() *engine.ExecutionPayloadEnvelope {
 	default:
 		close(payload.stop)
 	}
+	benchmark, delivered := payload.takeBenchmarkDelivery()
 	envelope := engine.BlockToExecutableData(payload.full, payload.fullFees, payload.sidecars, payload.requests)
 	if payload.fullWitness != nil {
 		envelope.Witness = new(hexutil.Bytes)
 		*envelope.Witness, _ = rlp.EncodeToBytes(payload.fullWitness) // cannot fail
 	}
+	payload.lock.Unlock()
+
+	if benchmark != nil {
+		benchmark.recordDelivered(delivered)
+	}
 	return envelope
 }
 
-func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iteration int, payload *Payload, params *generateParams, witness bool) {
+func (miner *Miner) runBuildIteration(ctx context.Context, start time.Time, iteration int, strategy string, payload *Payload, params *generateParams, witness bool) {
 	ctx, span, spanEnd := telemetry.StartSpan(ctx, "miner.buildIteration",
 		telemetry.IntAttribute("iteration", iteration),
 	)
 	var err error
 	defer spanEnd(&err)
 
-	r := miner.generateWork(ctx, params, witness)
+	benchmark := miner.newBenchmarkAttempt(payload.id, iteration, strategy)
+	r := miner.generateWorkWithBenchmark(ctx, params, witness, benchmark)
+	elapsed := time.Since(start)
 	err = r.err
 	if err == nil {
-		accepted := payload.update(r, time.Since(start))
+		accepted := payload.update(r, elapsed)
 		span.SetAttributes(telemetry.BoolAttribute("update.accepted", accepted))
 	} else {
+		if benchmark != nil {
+			benchmark.recordInterrupted(elapsed, err)
+		}
 		log.Info("Error while generating work", "id", payload.id, "err", err)
 	}
 }
@@ -292,6 +329,9 @@ func (miner *Miner) buildPayload(ctx context.Context, args *BuildPayloadArgs, wi
 	}
 	// Construct a payload object for return.
 	payload := newPayload(empty.block, empty.requests, empty.witness, payloadID)
+	// The benchmark strategy is fixed per payload so every iteration of one
+	// payload is built the same way.
+	benchmarkStrategy := miner.payloadBenchmarkStrategy()
 
 	// Spin up a routine for updating the payload in background. This strategy
 	// can maximum the revenue for including transactions with highest fee.
@@ -344,7 +384,7 @@ func (miner *Miner) buildPayload(ctx context.Context, args *BuildPayloadArgs, wi
 				}
 				start := time.Now()
 				iteration++
-				miner.runBuildIteration(bCtx, start, iteration, payload, fullParams, witness)
+				miner.runBuildIteration(bCtx, start, iteration, benchmarkStrategy, payload, fullParams, witness)
 				timer.Reset(max(0, miner.config.Recommit-time.Since(start)))
 			case <-payload.stop:
 				payload.updateSpanForDelivery(bSpan)
