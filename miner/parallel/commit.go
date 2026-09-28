@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -49,13 +50,17 @@ type committer struct {
 
 // run commits tasks in order and reports whether the block became full.
 // it waits for each task to finish, and re executes it if its reads no longer hold.
+// note: in future maybe we can gain more speedup by not waiting for each task and
+// not caring about the order of transactions in the block TBD.
 func (c *committer) run(ctx context.Context, tasks []*Task) (bool, error) {
 	for _, t := range tasks {
 		if c.dropped[t.Sender] {
 			c.drop(t)
 			continue
 		}
+		started := time.Now()
 		result, err := t.wait(ctx)
+		c.stats.WaitTime += time.Since(started)
 		if err != nil {
 			return false, err
 		}
@@ -79,14 +84,19 @@ func (c *committer) run(ctx context.Context, tasks []*Task) (bool, error) {
 			} else {
 				c.reject(t)
 			}
-		} else if err := c.block.Include(t, result); err != nil {
-			c.reject(t)
-		} else {
-			// tx was included so we can publish the coibase balance
-			// to the store.
-			c.publishCoinbase(t.Position)
-			c.stats.Committed++
+			continue
 		}
+		started = time.Now()
+		err = c.block.Include(t, result)
+		c.stats.CommitTime += time.Since(started)
+		if err != nil {
+			c.reject(t)
+			continue
+		}
+		// tx was included so we can publish the coibase balance
+		// to the store.
+		c.publishCoinbase(t.Position)
+		c.stats.Committed++
 	}
 	return false, nil
 }
@@ -109,7 +119,10 @@ func (c *committer) settle(ctx context.Context, t *Task, r *Result) (*Result, er
 		c.stats.Stale++
 		c.sched.rerun(t, r)
 		var err error
-		if r, err = t.wait(ctx); err != nil {
+		started := time.Now()
+		r, err = t.wait(ctx)
+		c.stats.WaitTime += time.Since(started)
+		if err != nil {
 			return nil, err
 		}
 		reruns++

@@ -2,6 +2,7 @@ package parallel
 
 import (
 	"context"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -29,6 +30,10 @@ type Stats struct {
 	Stale      int
 	Committed  int
 	Dropped    int
+
+	ExecutionTime time.Duration // time summed over all executions
+	CommitTime    time.Duration // time the committer spent applying results
+	WaitTime      time.Duration // time the committer spent waiting for results
 }
 
 // Engine executes candidate transactions in parallel and commits them in
@@ -112,7 +117,9 @@ func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, err
 	sched := newScheduler(e.store, e.workers, e.exec.run)
 	sched.start(tasks)
 	defer func() {
-		e.stats.Executions += sched.stop()
+		executions, executionTime := sched.stop()
+		e.stats.Executions += executions
+		e.stats.ExecutionTime += executionTime
 	}()
 
 	c := &committer{

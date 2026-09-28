@@ -3,6 +3,7 @@ package parallel
 import (
 	"container/heap"
 	"sync"
+	"time"
 )
 
 // scheduler hands tasks to a fixed set of workers, lowest position first.
@@ -10,12 +11,13 @@ type scheduler struct {
 	store *store
 	run   func(*Task) *Result
 
-	mu         sync.Mutex
-	cond       *sync.Cond
-	ready      taskHeap
-	closed     bool
-	executions int
-	wg         sync.WaitGroup
+	mu            sync.Mutex
+	cond          *sync.Cond
+	ready         taskHeap
+	closed        bool
+	executions    int
+	executionTime time.Duration
+	wg            sync.WaitGroup
 }
 
 func newScheduler(s *store, workers int, run func(*Task) *Result) *scheduler {
@@ -64,14 +66,14 @@ func (s *scheduler) rerun(t *Task, r *Result) {
 }
 
 // stop lets running executions finish and stops the workers.
-func (s *scheduler) stop() int {
+func (s *scheduler) stop() (int, time.Duration) {
 	s.mu.Lock()
 	s.closed = true
 	s.ready = nil
 	s.mu.Unlock()
 	s.cond.Broadcast()
 	s.wg.Wait()
-	return s.executions
+	return s.executions, s.executionTime
 }
 
 func (s *scheduler) push(t *Task) {
@@ -108,9 +110,11 @@ func (s *scheduler) work() {
 		}
 		var res *Result
 		if !t.isDropped() {
+			started := time.Now()
 			res = s.run(t)
 			s.mu.Lock()
 			s.executions++
+			s.executionTime += time.Since(started)
 			s.mu.Unlock()
 		}
 		s.finish(t, res)

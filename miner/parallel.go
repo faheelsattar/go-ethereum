@@ -110,7 +110,8 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		}
 		log.Info("Parallel block building summary", "number", env.header.Number, "batches", metrics.batches,
 			"planned", metrics.Planned, "executions", metrics.Executions, "stale", metrics.Stale,
-			"committed", metrics.Committed, "dropped", metrics.Dropped, "wall", metrics.wall)
+			"committed", metrics.Committed, "dropped", metrics.Dropped, "wall", metrics.wall,
+			"executionTime", metrics.ExecutionTime, "commitTime", metrics.CommitTime, "waitTime", metrics.WaitTime)
 	}()
 	for {
 		if interrupt != nil {
