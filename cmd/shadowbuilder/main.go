@@ -25,7 +25,7 @@ func main() {
 		beacon    = flag.String("parent-beacon-root", common.Hash{}.Hex(), "parent beacon block root")
 		timestamp = flag.Uint64("timestamp", 0, "payload timestamp (default: parent timestamp + 12)")
 		buildTime = flag.Duration("build-time", 3*time.Second, "time to let geth build before retrieving the payload")
-		version   = flag.Int("getpayload-version", 5, "engine_getPayload version (3, 4, or 5)")
+		version   = flag.Int("getpayload-version", 5, "engine_getPayload version: 3 cancun, 4 prague, 5 osaka, 6 amsterdam")
 		validate  = flag.Bool("validate", true, "feed the built payload back through engine_newPayload to validate it")
 	)
 	flag.Parse()
@@ -39,7 +39,7 @@ func main() {
 	if !common.IsHexAddress(*fee) {
 		log.Fatalf("invalid fee recipient %q", *fee)
 	}
-	if *version < 3 || *version > 5 {
+	if *version < 3 || *version > 6 {
 		log.Fatalf("unsupported getPayload version %d", *version)
 	}
 
@@ -111,7 +111,7 @@ func main() {
 		switch *version {
 		case 3:
 			err = client.CallContext(ctx, &status, "engine_newPayloadV3", result, hashes, parentBeaconRoot)
-		case 4:
+		case 4, 5:
 			err = client.CallContext(ctx, &status, "engine_newPayloadV4", result, hashes, parentBeaconRoot, requestsOrEmpty(payload.Requests))
 		default:
 			err = client.CallContext(ctx, &status, "engine_newPayloadV5", result, hashes, parentBeaconRoot, requestsOrEmpty(payload.Requests))
