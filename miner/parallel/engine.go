@@ -64,7 +64,7 @@ func New(cfg Config) (*Engine, error) {
 			header:   types.CopyHeader(cfg.Header),
 			coinbase: cfg.Coinbase,
 			store:    s,
-			parent:   parent,
+			parent:   newCachedStateReader(parent),
 		},
 		workers: max(1, cfg.Workers),
 		dropped: make(map[common.Address]bool),
