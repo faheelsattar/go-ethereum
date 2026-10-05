@@ -3,6 +3,7 @@ package parallel
 import (
 	"container/heap"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -15,8 +16,8 @@ type scheduler struct {
 	cond          *sync.Cond
 	ready         taskHeap
 	closed        bool
-	executions    int
-	executionTime time.Duration
+	executions    atomic.Int64
+	executionTime atomic.Int64
 	wg            sync.WaitGroup
 }
 
@@ -73,7 +74,7 @@ func (s *scheduler) stop() (int, time.Duration) {
 	s.mu.Unlock()
 	s.cond.Broadcast()
 	s.wg.Wait()
-	return s.executions, s.executionTime
+	return int(s.executions.Load()), time.Duration(s.executionTime.Load())
 }
 
 func (s *scheduler) push(t *Task) {
@@ -112,10 +113,8 @@ func (s *scheduler) work() {
 		if !t.isDropped() {
 			started := time.Now()
 			res = s.run(t)
-			s.mu.Lock()
-			s.executions++
-			s.executionTime += time.Since(started)
-			s.mu.Unlock()
+			s.executions.Add(1)
+			s.executionTime.Add(int64(time.Since(started)))
 		}
 		s.finish(t, res)
 	}
