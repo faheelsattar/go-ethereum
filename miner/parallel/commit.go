@@ -75,7 +75,7 @@ func (c *committer) run(ctx context.Context, tasks []*Task) (bool, error) {
 			c.reject(t)
 			continue
 		}
-		if result, err = c.settle(ctx, t, result); err != nil {
+		if result, err = c.settle(t, result); err != nil {
 			return false, err
 		}
 		if result.Err != nil {
@@ -102,7 +102,7 @@ func (c *committer) run(ctx context.Context, tasks []*Task) (bool, error) {
 }
 
 // settle reexecutes t until its results reads hold against the block state.
-func (c *committer) settle(ctx context.Context, t *Task, r *Result) (*Result, error) {
+func (c *committer) settle(t *Task, r *Result) (*Result, error) {
 	reruns := 0
 	for {
 		if r == nil {
@@ -114,17 +114,12 @@ func (c *committer) settle(ctx context.Context, t *Task, r *Result) (*Result, er
 		if reruns == maxReruns {
 			return nil, fmt.Errorf("task %d still stale after %d reexecutions", t.Position, reruns)
 		}
-		// since the result is stale we need to discard it and reexecute
-		// by pushing it back to the scheduler.
+		// the result is stale, so discard it and execute the task again here
+		// rather than wake a worker and wait for it.
 		c.stats.Stale++
-		c.sched.rerun(t, r)
-		var err error
 		started := time.Now()
-		r, err = t.wait(ctx)
+		r = c.sched.rerun(t, r)
 		c.stats.WaitTime += time.Since(started)
-		if err != nil {
-			return nil, err
-		}
 		reruns++
 	}
 }

@@ -86,6 +86,7 @@ type Task struct {
 	prev, next *Task // same sender neighbours; a scheduling hint only
 
 	mu       sync.Mutex
+	once     sync.Once
 	tx       *types.Transaction
 	result   *Result
 	done     chan struct{}
@@ -110,14 +111,13 @@ func (t *Task) Tx() *types.Transaction {
 }
 
 func (t *Task) resolve() *types.Transaction {
-	if tx := t.Tx(); tx != nil {
-		return tx
-	}
-	tx := t.Lazy.Resolve()
-	t.mu.Lock()
-	t.tx = tx
-	t.mu.Unlock()
-	return tx
+	t.once.Do(func() {
+		tx := t.Lazy.Resolve()
+		t.mu.Lock()
+		t.tx = tx
+		t.mu.Unlock()
+	})
+	return t.Tx()
 }
 
 func (t *Task) isDropped() bool {

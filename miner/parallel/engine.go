@@ -82,6 +82,11 @@ func (e *Engine) NewTask(lazy *txpool.LazyTransaction, sender common.Address, bl
 	}
 	e.next++
 	e.stats.Planned++
+	// resolving a blob transaction reconstructs its blobs, which takes
+	// milliseconds, so start right away instead of on the worker
+	if blob {
+		go t.resolve()
+	}
 	return t
 }
 
@@ -114,11 +119,12 @@ func (e *Engine) Seed(fn func(vm.StateDB) error) error {
 // Run executes tasks and commits them into block in position order. It returns
 // true once block reports that it is full.
 func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, error) {
-	sched := newScheduler(e.store, e.workers, e.exec.run)
+	sched := newScheduler(e.store, e.workers, e.exec.run, e.exec.stale)
 	sched.start(tasks)
 	defer func() {
-		executions, executionTime := sched.stop()
+		executions, stale, executionTime := sched.stop()
 		e.stats.Executions += executions
+		e.stats.Stale += stale
 		e.stats.ExecutionTime += executionTime
 	}()
 
