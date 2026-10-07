@@ -112,9 +112,11 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			log.Warn("Parallel block building failed", "number", env.header.Number, "err", err)
 		}
 		log.Info("Parallel block building summary", "number", env.header.Number, "batches", metrics.batches,
-			"planned", metrics.Planned, "executions", metrics.Executions, "stale", metrics.Stale,
+			"planned", metrics.Planned, "chained", metrics.Chained, "longestChain", metrics.LongestChain,
+			"executions", metrics.Executions, "stale", metrics.Stale,
 			"committed", metrics.Committed, "dropped", metrics.Dropped, "wall", metrics.wall,
-			"executionTime", metrics.ExecutionTime, "validateTime", metrics.ValidateTime, "commitTime", metrics.CommitTime, "waitTime", metrics.WaitTime)
+			"executionTime", metrics.ExecutionTime, "validateTime", metrics.ValidateTime, "commitTime", metrics.CommitTime,
+			"waitTime", metrics.WaitTime, "chainWaitTime", metrics.ChainWaitTime)
 	}()
 	for {
 		if interrupt != nil {

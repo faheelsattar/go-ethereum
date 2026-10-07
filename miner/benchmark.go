@@ -46,12 +46,15 @@ type buildBenchmarkAttempt struct {
 	waitTime         time.Duration // parallel only: time the committer spent waiting for results
 	finalizationTime time.Duration
 
-	batches    int
-	planned    int
-	executions int
-	stale      int
-	committed  int
-	dropped    int
+	batches       int
+	planned       int
+	executions    int
+	stale         int
+	committed     int
+	dropped       int
+	chained       int
+	longestChain  int
+	chainWaitTime time.Duration
 }
 
 type benchmarkEvent struct {
@@ -96,6 +99,10 @@ type benchmarkEvent struct {
 	Stale      int `json:"stale"`
 	Committed  int `json:"committed"`
 	Dropped    int `json:"dropped"`
+
+	Chained         int   `json:"chained"`
+	LongestChain    int   `json:"longestChain"`
+	ChainWaitTimeNs int64 `json:"chainWaitTimeNs"`
 }
 
 func newBenchmarkRecorder(path string) *benchmarkRecorder {
@@ -169,6 +176,9 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.stale += metrics.Stale
 	attempt.committed += metrics.Committed
 	attempt.dropped += metrics.Dropped
+	attempt.chained += metrics.Chained
+	attempt.longestChain = max(attempt.longestChain, metrics.LongestChain)
+	attempt.chainWaitTime += metrics.ChainWaitTime
 	attempt.executionTime += metrics.ExecutionTime
 	attempt.validateTime += metrics.ValidateTime
 	attempt.commitTime += metrics.CommitTime
@@ -200,6 +210,9 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		Stale:                      attempt.stale,
 		Committed:                  attempt.committed,
 		Dropped:                    attempt.dropped,
+		Chained:                    attempt.chained,
+		LongestChain:               attempt.longestChain,
+		ChainWaitTimeNs:            attempt.chainWaitTime.Nanoseconds(),
 	}
 }
 

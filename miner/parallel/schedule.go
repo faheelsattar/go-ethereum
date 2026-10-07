@@ -7,10 +7,12 @@ import (
 	"time"
 )
 
-// scheduler hands tasks to a fixed set of workers, lowest position first.
+// scheduler hands tasks to a fixed set of workers, lowest position first, and
+// reports each finished task on finished.
 type scheduler struct {
-	store *store
-	run   func(*Task) *Result
+	store    *store
+	run      func(*Task) *Result
+	finished chan *Task
 
 	mu            sync.Mutex
 	cond          *sync.Cond
@@ -36,6 +38,7 @@ func newScheduler(s *store, workers int, run func(*Task) *Result) *scheduler {
 
 // start releases every task that has no predecessor to wait for.
 func (s *scheduler) start(tasks []*Task) {
+	s.finished = make(chan *Task, len(tasks))
 	for _, t := range tasks {
 		if t.prev == nil {
 			s.release(t)
@@ -53,19 +56,6 @@ func (s *scheduler) release(t *Task) {
 	if !released {
 		s.push(t)
 	}
-}
-
-// rerun discards the result r of t and executes t again on the calling
-// goroutine, returning the new result.
-func (s *scheduler) rerun(t *Task, r *Result) *Result {
-	t.mu.Lock()
-	s.store.unpublish(t.Position, r.writes)
-	t.result = nil
-	t.done = make(chan struct{})
-	t.mu.Unlock()
-	res := s.execute(t)
-	s.finish(t, res)
-	return res
 }
 
 // stop lets running executions finish and stops the workers.
@@ -111,31 +101,22 @@ func (s *scheduler) work() {
 		if t == nil {
 			return
 		}
-		var res *Result
-		if !t.isDropped() {
-			res = s.execute(t)
-		}
+		started := time.Now()
+		res := s.run(t)
+		s.executions.Add(1)
+		s.executionTime.Add(int64(time.Since(started)))
 		s.finish(t, res)
 	}
 }
 
-func (s *scheduler) execute(t *Task) *Result {
-	started := time.Now()
-	res := s.run(t)
-	s.executions.Add(1)
-	s.executionTime.Add(int64(time.Since(started)))
-	return res
-}
-
-// finish publishes the result of t and releases its same-sender successor.
+// finish publishes the result of t, reports it and releases the same-sender
+// successor of t.
 func (s *scheduler) finish(t *Task, res *Result) {
 	t.mu.Lock()
-	if res != nil && !t.dropped {
-		s.store.publish(t.Position, res.writes, res.codes)
-		t.result = res
-	}
-	close(t.done)
+	s.store.publish(t.Position, res.writes, res.codes)
+	t.result = res
 	t.mu.Unlock()
+	s.finished <- t
 	if t.next != nil {
 		s.release(t.next)
 	}

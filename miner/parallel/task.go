@@ -2,7 +2,6 @@ package parallel
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"slices"
 	"sync"
@@ -89,8 +88,6 @@ type Task struct {
 	once     sync.Once
 	tx       *types.Transaction
 	result   *Result
-	done     chan struct{}
-	dropped  bool
 	released bool
 }
 
@@ -118,27 +115,6 @@ func (t *Task) resolve() *types.Transaction {
 		t.mu.Unlock()
 	})
 	return t.Tx()
-}
-
-func (t *Task) isDropped() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.dropped
-}
-
-// wait blocks until the current execution of t has finished
-func (t *Task) wait(ctx context.Context) (*Result, error) {
-	t.mu.Lock()
-	done := t.done
-	t.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-done:
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.result, nil
 }
 
 // Result is the outcome of one execution of a Task.
