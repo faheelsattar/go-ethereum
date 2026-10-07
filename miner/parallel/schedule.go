@@ -11,23 +11,20 @@ import (
 type scheduler struct {
 	store *store
 	run   func(*Task) *Result
-	stale func(*Task, *Result) bool
 
 	mu            sync.Mutex
 	cond          *sync.Cond
 	ready         taskHeap
 	closed        bool
 	executions    atomic.Int64
-	reruns        atomic.Int64
 	executionTime atomic.Int64
 	wg            sync.WaitGroup
 }
 
-func newScheduler(s *store, workers int, run func(*Task) *Result, stale func(*Task, *Result) bool) *scheduler {
+func newScheduler(s *store, workers int, run func(*Task) *Result) *scheduler {
 	sched := &scheduler{
 		store: s,
 		run:   run,
-		stale: stale,
 	}
 	sched.cond = sync.NewCond(&sched.mu)
 	sched.wg.Add(workers)
@@ -72,14 +69,14 @@ func (s *scheduler) rerun(t *Task, r *Result) *Result {
 }
 
 // stop lets running executions finish and stops the workers.
-func (s *scheduler) stop() (int, int, time.Duration) {
+func (s *scheduler) stop() (int, time.Duration) {
 	s.mu.Lock()
 	s.closed = true
 	s.ready = nil
 	s.mu.Unlock()
 	s.cond.Broadcast()
 	s.wg.Wait()
-	return int(s.executions.Load()), int(s.reruns.Load()), time.Duration(s.executionTime.Load())
+	return int(s.executions.Load()), time.Duration(s.executionTime.Load())
 }
 
 func (s *scheduler) push(t *Task) {
@@ -122,17 +119,10 @@ func (s *scheduler) work() {
 	}
 }
 
-// execute runs t and, while a lower task has meanwhile changed something it
-// read, runs it again before the result becomes visible to anyone.
 func (s *scheduler) execute(t *Task) *Result {
 	started := time.Now()
 	res := s.run(t)
-	runs := 1
-	for ; runs <= maxReruns && s.stale(t, res); runs++ {
-		s.reruns.Add(1)
-		res = s.run(t)
-	}
-	s.executions.Add(int64(runs))
+	s.executions.Add(1)
 	s.executionTime.Add(int64(time.Since(started)))
 	return res
 }

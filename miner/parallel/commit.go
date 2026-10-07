@@ -108,7 +108,10 @@ func (c *committer) settle(t *Task, r *Result) (*Result, error) {
 		if r == nil {
 			return nil, errors.New("task dropped while committing")
 		}
-		if !stale(c.block.State(), r.reads) {
+		started := time.Now()
+		fresh := !stale(c.block.State(), r.reads)
+		c.stats.ValidateTime += time.Since(started)
+		if fresh {
 			return r, nil
 		}
 		if reruns == maxReruns {
@@ -117,7 +120,7 @@ func (c *committer) settle(t *Task, r *Result) (*Result, error) {
 		// the result is stale, so discard it and execute the task again here
 		// rather than wake a worker and wait for it.
 		c.stats.Stale++
-		started := time.Now()
+		started = time.Now()
 		r = c.sched.rerun(t, r)
 		c.stats.WaitTime += time.Since(started)
 		reruns++

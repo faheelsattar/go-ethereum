@@ -68,16 +68,3 @@ func (e *executor) run(t *Task) (res *Result) {
 	res.Receipt, res.AccessList = receipt, accessList
 	return res
 }
-
-// stale reports whether the values r read differ from what the store and the
-// parent state now serve at the position of t.
-func (e *executor) stale(t *Task, r *Result) bool {
-	reader := newVersionedStateReader(t.Position, e.store, e.parent)
-	for k, v := range r.reads {
-		cur, err := reader.base(k)
-		if err != nil || cur != v {
-			return true
-		}
-	}
-	return false
-}

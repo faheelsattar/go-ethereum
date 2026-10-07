@@ -32,6 +32,7 @@ type Stats struct {
 	Dropped    int
 
 	ExecutionTime time.Duration // time summed over all executions
+	ValidateTime  time.Duration // time the committer spent checking reads against the block state
 	CommitTime    time.Duration // time the committer spent applying results
 	WaitTime      time.Duration // time the committer spent waiting for results
 }
@@ -119,12 +120,11 @@ func (e *Engine) Seed(fn func(vm.StateDB) error) error {
 // Run executes tasks and commits them into block in position order. It returns
 // true once block reports that it is full.
 func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, error) {
-	sched := newScheduler(e.store, e.workers, e.exec.run, e.exec.stale)
+	sched := newScheduler(e.store, e.workers, e.exec.run)
 	sched.start(tasks)
 	defer func() {
-		executions, stale, executionTime := sched.stop()
+		executions, executionTime := sched.stop()
 		e.stats.Executions += executions
-		e.stats.Stale += stale
 		e.stats.ExecutionTime += executionTime
 	}()
 

@@ -41,6 +41,7 @@ type buildBenchmarkAttempt struct {
 	totalBuildWall   time.Duration // the whole build, including finalization
 	transactionWall  time.Duration // the commit loops only, comparable across strategies
 	executionTime    time.Duration // EVM time summed over all executions
+	validateTime     time.Duration // parallel only: time the committer spent checking reads
 	commitTime       time.Duration // parallel only: time the committer spent applying results
 	waitTime         time.Duration // parallel only: time the committer spent waiting for results
 	finalizationTime time.Duration
@@ -83,6 +84,7 @@ type benchmarkEvent struct {
 	TotalBuildWallNs           int64 `json:"totalBuildWallNs"`
 	TransactionExecutionWallNs int64 `json:"transactionExecutionWallNs"`
 	EVMExecutionWorkNs         int64 `json:"evmExecutionWorkNs"`
+	ValidateTimeNs             int64 `json:"validateTimeNs"`
 	CommitTimeNs               int64 `json:"commitTimeNs"`
 	WaitTimeNs                 int64 `json:"waitTimeNs"`
 	FinalizationNs             int64 `json:"finalizationNs"`
@@ -168,6 +170,7 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.committed += metrics.Committed
 	attempt.dropped += metrics.Dropped
 	attempt.executionTime += metrics.ExecutionTime
+	attempt.validateTime += metrics.ValidateTime
 	attempt.commitTime += metrics.CommitTime
 	attempt.waitTime += metrics.WaitTime
 }
@@ -186,6 +189,7 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		TotalBuildWallNs:           attempt.totalBuildWall.Nanoseconds(),
 		TransactionExecutionWallNs: attempt.transactionWall.Nanoseconds(),
 		EVMExecutionWorkNs:         attempt.executionTime.Nanoseconds(),
+		ValidateTimeNs:             attempt.validateTime.Nanoseconds(),
 		CommitTimeNs:               attempt.commitTime.Nanoseconds(),
 		WaitTimeNs:                 attempt.waitTime.Nanoseconds(),
 		FinalizationNs:             attempt.finalizationTime.Nanoseconds(),
