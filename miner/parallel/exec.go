@@ -20,20 +20,29 @@ var errUnavailable = errors.New("transaction no longer available")
 // noVersions lies below every position, so a reader at it serves only its parent.
 const noVersions = math.MinInt
 
+// allVersions lies above every position, so a reader at it serves the newest versions.
+const allVersions = math.MaxInt
+
 // executor runs tasks against the state seen from their position.
 type executor struct {
-	chain    core.ChainContext
-	config   *params.ChainConfig
-	db       state.Database
-	root     common.Hash
-	header   *types.Header
-	coinbase common.Address
-	store    *store
-	parent   state.Reader
+	chain     core.ChainContext
+	config    *params.ChainConfig
+	db        state.Database
+	root      common.Hash
+	header    *types.Header
+	coinbase  common.Address
+	store     *store
+	committed *store
+	parent    state.Reader
 }
 
-// run executes t on the parent state plus the versions below its position.
+// run executes t on the parent state plus the versions below its position. A
+// requeued task was stale once already, so it runs on the committed writes
+// instead, which is the block state as of now.
 func (e *executor) run(t *Task) *Result {
+	if t.requeues > 0 {
+		return e.execute(t, newVersionedStateReader(allVersions, e.committed, e.parent))
+	}
 	return e.execute(t, newVersionedStateReader(t.Position, e.store, e.parent))
 }
 

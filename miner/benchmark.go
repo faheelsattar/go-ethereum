@@ -50,6 +50,7 @@ type buildBenchmarkAttempt struct {
 	planned       int
 	executions    int
 	stale         int
+	requeued      int
 	committed     int
 	dropped       int
 	chained       int
@@ -97,6 +98,7 @@ type benchmarkEvent struct {
 	Planned    int `json:"planned"`
 	Executions int `json:"executions"`
 	Stale      int `json:"stale"`
+	Requeued   int `json:"requeued"`
 	Committed  int `json:"committed"`
 	Dropped    int `json:"dropped"`
 
@@ -174,6 +176,7 @@ func (attempt *buildBenchmarkAttempt) addParallelMetrics(metrics *parallelBuildM
 	attempt.planned += metrics.Planned
 	attempt.executions += metrics.Executions
 	attempt.stale += metrics.Stale
+	attempt.requeued += metrics.Requeued
 	attempt.committed += metrics.Committed
 	attempt.dropped += metrics.Dropped
 	attempt.chained += metrics.Chained
@@ -208,6 +211,7 @@ func (attempt *buildBenchmarkAttempt) event(name string) benchmarkEvent {
 		Planned:                    attempt.planned,
 		Executions:                 attempt.executions,
 		Stale:                      attempt.stale,
+		Requeued:                   attempt.requeued,
 		Committed:                  attempt.committed,
 		Dropped:                    attempt.dropped,
 		Chained:                    attempt.chained,

@@ -89,6 +89,7 @@ type Task struct {
 	tx       *types.Transaction
 	result   *Result
 	released bool
+	requeues int // times the committer handed the task back as stale
 }
 
 // Follow records that t must not start before prev has executed once.

@@ -38,7 +38,8 @@ func newScheduler(s *store, workers int, run func(*Task) *Result) *scheduler {
 
 // start releases every task that has no predecessor to wait for.
 func (s *scheduler) start(tasks []*Task) {
-	s.finished = make(chan *Task, len(tasks))
+	// every task finishes once, plus once per requeue
+	s.finished = make(chan *Task, len(tasks)*(1+maxRequeues))
 	for _, t := range tasks {
 		if t.prev == nil {
 			s.release(t)

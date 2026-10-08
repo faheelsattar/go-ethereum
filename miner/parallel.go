@@ -113,7 +113,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		}
 		log.Info("Parallel block building summary", "number", env.header.Number, "batches", metrics.batches,
 			"planned", metrics.Planned, "chained", metrics.Chained, "longestChain", metrics.LongestChain,
-			"executions", metrics.Executions, "stale", metrics.Stale,
+			"executions", metrics.Executions, "stale", metrics.Stale, "requeued", metrics.Requeued,
 			"committed", metrics.Committed, "dropped", metrics.Dropped, "wall", metrics.wall,
 			"executionTime", metrics.ExecutionTime, "validateTime", metrics.ValidateTime, "commitTime", metrics.CommitTime,
 			"waitTime", metrics.WaitTime, "chainWaitTime", metrics.ChainWaitTime)

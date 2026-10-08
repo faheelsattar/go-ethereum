@@ -29,7 +29,8 @@ type Stats struct {
 	Chained      int // tasks that had to wait for an earlier one from the same sender
 	LongestChain int
 	Executions   int
-	Stale        int // results replaced by an execution on the block state
+	Stale        int // results whose reads no longer held at commit time
+	Requeued     int // stale tasks handed back to the workers
 	Committed    int
 	Dropped      int
 
@@ -43,12 +44,13 @@ type Stats struct {
 // Engine executes candidate transactions in parallel and commits them in
 // position order.
 type Engine struct {
-	store   *store
-	exec    *executor
-	workers int
-	next    int
-	dropped map[common.Address]bool
-	stats   Stats
+	store     *store
+	committed *store // writes of committed transactions, versioned by commit order
+	exec      *executor
+	workers   int
+	next      int
+	dropped   map[common.Address]bool
+	stats     Stats
 }
 
 // New returns an engine building on the parent state described by cfg.
@@ -57,18 +59,20 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := newStore()
+	s, committed := newStore(), newStore()
 	return &Engine{
-		store: s,
+		store:     s,
+		committed: committed,
 		exec: &executor{
-			chain:    cfg.Chain,
-			config:   cfg.Params,
-			db:       cfg.DB,
-			root:     cfg.Root,
-			header:   types.CopyHeader(cfg.Header),
-			coinbase: cfg.Coinbase,
-			store:    s,
-			parent:   parent,
+			chain:     cfg.Chain,
+			config:    cfg.Params,
+			db:        cfg.DB,
+			root:      cfg.Root,
+			header:    types.CopyHeader(cfg.Header),
+			coinbase:  cfg.Coinbase,
+			store:     s,
+			committed: committed,
+			parent:    parent,
 		},
 		workers: max(1, cfg.Workers),
 		dropped: make(map[common.Address]bool),
@@ -116,6 +120,7 @@ func (e *Engine) Seed(fn func(vm.StateDB) error) error {
 		return err
 	}
 	e.store.publish(-1, res.writes, res.codes)
+	e.committed.publish(-1, res.writes, res.codes)
 	return nil
 }
 
@@ -140,13 +145,15 @@ func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, err
 	}()
 
 	c := &committer{
-		store:    e.store,
-		runOn:    e.exec.runOn,
-		finished: sched.finished,
-		block:    block,
-		coinbase: e.exec.coinbase,
-		dropped:  e.dropped,
-		stats:    &e.stats,
+		store:     e.store,
+		committed: e.committed,
+		runOn:     e.exec.runOn,
+		requeue:   sched.push,
+		finished:  sched.finished,
+		block:     block,
+		coinbase:  e.exec.coinbase,
+		dropped:   e.dropped,
+		stats:     &e.stats,
 	}
 	return c.run(ctx, tasks)
 }
