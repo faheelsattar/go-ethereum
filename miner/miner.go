@@ -53,6 +53,7 @@ type Config struct {
 	MaxBlobsPerBlock    int            // Maximum number of blobs per block (0 for unset uses protocol default)
 	ParallelExecution   bool           // Execute transactions optimistically with a shared worker pool.
 	ParallelWorkers     int            // Maximum optimistic execution workers.
+	ParallelSharedReads bool           // Share the parent state reads of the parallel engine with the block state.
 
 	ParallelBenchmarkMode    string // Parallel execution benchmark mode: off or alternate.
 	ParallelBenchmarkOutput  string // JSONL output file for parallel execution benchmark events.

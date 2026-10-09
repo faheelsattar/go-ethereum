@@ -21,6 +21,10 @@ type Config struct {
 	Root     common.Hash // parent state root
 	Header   *types.Header
 	Coinbase common.Address
+
+	// Reader, if set, reads the parent state instead of DB.Reader(Root), such
+	// as a SharedReader the block state also reads through.
+	Reader state.Reader
 }
 
 // Stats counts what happened during a build.
@@ -72,9 +76,12 @@ type Engine struct {
 
 // New returns an engine building on the parent state described by cfg.
 func New(cfg Config) (*Engine, error) {
-	parent, err := cfg.DB.Reader(cfg.Root)
-	if err != nil {
-		return nil, err
+	parent := cfg.Reader
+	if parent == nil {
+		var err error
+		if parent, err = cfg.DB.Reader(cfg.Root); err != nil {
+			return nil, err
+		}
 	}
 	s, committed := newStore(), newStore()
 	return &Engine{

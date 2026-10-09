@@ -37,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/miner/parallel"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
@@ -62,10 +63,11 @@ func (miner *Miner) maxBlobsPerBlock(time uint64) int {
 // information of the sealing block generation.
 type environment struct {
 	signer   types.Signer
-	state    *state.StateDB // apply state changes here
-	tcount   int            // tx count in cycle
-	size     uint64         // size of the block we are building
-	gasPool  *core.GasPool  // available gas used to pack transactions
+	state    *state.StateDB         // apply state changes here
+	shared   *parallel.SharedReader // parent reads shared with the parallel engine, if any
+	tcount   int                    // tx count in cycle
+	size     uint64                 // size of the block we are building
+	gasPool  *core.GasPool          // available gas used to pack transactions
 	coinbase common.Address
 	evm      *vm.EVM
 
@@ -382,6 +384,14 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	if err != nil {
 		return nil, err
 	}
+	var shared *parallel.SharedReader
+	if miner.config.ParallelExecution && miner.config.ParallelSharedReads {
+		// the parallel engine's executions and the block state share their
+		// parent reads
+		if state, shared, err = miner.sharedState(parent); err != nil {
+			return nil, err
+		}
+	}
 	var bundle *stateless.Witness
 	if witness {
 		bundle, err = stateless.NewWitness(header, miner.chain, false)
@@ -399,6 +409,7 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 	return &environment{
 		signer:   types.MakeSigner(miner.chainConfig, header.Number, header.Time),
 		state:    state,
+		shared:   shared,
 		size:     uint64(header.Size()),
 		coinbase: coinbase,
 		gasPool:  core.NewGasPool(header.GasLimit),
@@ -733,4 +744,20 @@ func signalToErr(signal int32) error {
 	default:
 		panic(fmt.Errorf("undefined signal %d", signal))
 	}
+}
+
+// sharedState returns a state on parent whose parent reads go through a
+// cache that the parallel engine shares.
+func (miner *Miner) sharedState(parent *types.Header) (*state.StateDB, *parallel.SharedReader, error) {
+	db := state.NewMPTDatabase(miner.chain.TrieDB(), miner.chain.CodeDB()).WithSnapshot(miner.chain.Snapshots())
+	reader, err := db.Reader(parent.Root)
+	if err != nil {
+		return nil, nil, err
+	}
+	shared := parallel.NewSharedReader(reader)
+	sdb, err := state.NewWithReader(parent.Root, db, shared)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sdb, shared, nil
 }
