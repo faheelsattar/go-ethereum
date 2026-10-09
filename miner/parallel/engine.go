@@ -99,6 +99,8 @@ func New(cfg Config) (*Engine, error) {
 			store:     s,
 			committed: committed,
 			parent:    parent,
+			// a sequential build reuses one EVM and its code analysis
+			jumpDests: core.NewJumpDestCache(),
 		},
 		workers: max(1, cfg.Workers),
 		dropped: make(map[common.Address]bool),
