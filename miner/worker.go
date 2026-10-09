@@ -385,7 +385,8 @@ func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase
 		return nil, err
 	}
 	var shared *parallel.SharedReader
-	if miner.config.ParallelExecution && miner.config.ParallelSharedReads {
+	if miner.config.ParallelExecution && miner.config.ParallelSharedReads &&
+		!miner.chainConfig.IsUBT(parent.Number, parent.Time) && !miner.chainConfig.IsUBT(header.Number, header.Time) {
 		// the parallel engine's executions and the block state share their
 		// parent reads
 		if state, shared, err = miner.sharedState(parent); err != nil {

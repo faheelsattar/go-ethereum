@@ -200,6 +200,7 @@ func (c *committer) reject(t *Task) {
 
 func (c *committer) drop(t *Task) {
 	t.mu.Lock()
+	t.discarded = true
 	if t.result != nil {
 		c.store.unpublish(t.Position, t.result.writes)
 		t.result = nil

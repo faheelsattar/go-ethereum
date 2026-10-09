@@ -2,6 +2,8 @@ package parallel
 
 import (
 	"context"
+	"maps"
+	"slices"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -143,8 +145,22 @@ func (e *Engine) Seed(fn func(vm.StateDB) error) error {
 	if err != nil {
 		return err
 	}
-	e.store.publish(-1, res.writes, res.codes)
-	e.committed.publish(-1, res.writes, res.codes)
+	// additive balance changes become absolute versions, as the committer
+	// publishes them for transactions
+	writes := res.writes
+	if len(res.deltas) > 0 || res.fee != nil {
+		writes = maps.Clone(res.writes)
+		credited := slices.Collect(maps.Keys(res.deltas))
+		if res.fee != nil {
+			credited = append(credited, e.exec.coinbase)
+		}
+		for _, addr := range credited {
+			writes[key{addr: addr, field: exists}] = boolValue(true)
+			writes[key{addr: addr, field: balance}] = balanceValue(sdb.GetBalance(addr))
+		}
+	}
+	e.store.publish(-1, writes, res.codes)
+	e.committed.publish(-1, writes, res.codes)
 	return nil
 }
 

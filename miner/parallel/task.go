@@ -87,12 +87,13 @@ type Task struct {
 
 	prev, next *Task // same sender neighbours; a scheduling hint only
 
-	mu       sync.Mutex
-	once     sync.Once
-	tx       *types.Transaction
-	result   *Result
-	released bool
-	requeues int // times the committer handed the task back as stale
+	mu        sync.Mutex
+	once      sync.Once
+	tx        *types.Transaction
+	result    *Result
+	released  bool
+	discarded bool // dropped by the committer: a late result must not be published
+	requeues  int  // times the committer handed the task back as stale
 }
 
 // Follow records that t must not start before prev has executed once.

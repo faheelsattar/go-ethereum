@@ -114,8 +114,10 @@ func (s *scheduler) work() {
 // successor of t.
 func (s *scheduler) finish(t *Task, res *Result) {
 	t.mu.Lock()
-	s.store.publish(t.Position, res.writes, res.codes)
-	t.result = res
+	if !t.discarded {
+		s.store.publish(t.Position, res.writes, res.codes)
+		t.result = res
+	}
 	t.mu.Unlock()
 	s.finished <- t
 	if t.next != nil {
