@@ -204,8 +204,17 @@ func (t *trackingStateDB) result() (*Result, error) {
 		res.writes[key{addr: addr, field: code}] = hashValue(types.EmptyCodeHash)
 		res.writes[key{addr: addr, field: destructed}] = value{}
 	}
+	// The coinbase credit is its net balance change, not the sum of the
+	// credits: a credit inside a call that reverted is rolled back in the
+	// state but not in t.fee.
 	if _, absolute := t.written[key{addr: t.coinbase, field: balance}]; !absolute && !t.fee.IsZero() {
-		res.fee = new(uint256.Int).Set(&t.fee)
+		initial, err := t.reader.base(key{addr: t.coinbase, field: balance})
+		if err != nil {
+			return nil, err
+		}
+		if final := t.StateDB.GetBalance(t.coinbase); final.Gt(initial.balance()) {
+			res.fee = new(uint256.Int).Sub(final, initial.balance())
+		}
 	}
 	return res, nil
 }
