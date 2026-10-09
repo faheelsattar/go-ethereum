@@ -68,7 +68,9 @@ func (e *executor) execute(t *Task, reader *versionedStateReader) (res *Result) 
 		return &Result{Err: err}
 	}
 	trackedStateDB := newTrackingStateDB(sdb, reader, e.coinbase)
-	evm := vm.NewEVM(core.NewEVMBlockContext(e.header, e.chain, &e.coinbase), trackedStateDB, e.config, vm.Config{})
+	blockCtx := core.NewEVMBlockContext(e.header, e.chain, &e.coinbase)
+	blockCtx.CanTransfer = trackedStateDB.canTransfer
+	evm := vm.NewEVM(blockCtx, trackedStateDB, e.config, vm.Config{})
 	defer evm.Release()
 
 	gas := core.NewGasPool(e.header.GasLimit)

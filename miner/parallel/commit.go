@@ -131,10 +131,12 @@ func (c *committer) commit(t *Task) (done bool, full bool, err error) {
 	r := t.result
 	t.mu.Unlock()
 	started := time.Now()
-	fresh := !stale(c.block.State(), r.reads)
+	conflict, isStale := resultStale(c.block.State(), r)
+	fresh := !isStale
 	c.stats.ValidateTime += time.Since(started)
 	if !fresh {
 		c.stats.Stale++
+		c.stats.recordStale(conflict)
 		if t.requeues < maxRequeues {
 			c.retract(t, r)
 			t.requeues++
@@ -222,34 +224,54 @@ func (c *committer) publishCommitted(pos int, r *Result) {
 	c.committed.publish(seq, coinbase, nil)
 }
 
-// stale reports whether any recorded read differs from the current state.
-func stale(sdb *state.StateDB, reads map[key]value) bool {
+// resultStale returns a read of r that no longer holds on sdb, if any,
+// including its balance requirements.
+func resultStale(sdb *state.StateDB, r *Result) (key, bool) {
+	if k, s := staleKey(sdb, r.reads); s {
+		return k, true
+	}
+	if addr, ok := r.holds(sdb); !ok {
+		return key{addr: addr, field: balance}, true
+	}
+	return key{}, false
+}
+
+// staleKey returns a recorded read that differs from the current state, if any.
+func staleKey(sdb *state.StateDB, reads map[key]value) (key, bool) {
 	for k, v := range reads {
-		switch k.field {
-		case exists:
-			if v != boolValue(sdb.Exist(k.addr)) {
+		if readStale(sdb, k, v) {
+			return k, true
+		}
+	}
+	return key{}, false
+}
+
+// readStale reports whether the read of k that returned v no longer holds.
+func readStale(sdb *state.StateDB, k key, v value) bool {
+	switch k.field {
+	case exists:
+		if v != boolValue(sdb.Exist(k.addr)) {
+			return true
+		}
+	case balance:
+		if v != balanceValue(sdb.GetBalance(k.addr)) {
+			return true
+		}
+	case nonce:
+		if v != uintValue(sdb.GetNonce(k.addr)) {
+			return true
+		}
+	case code:
+		if !sdb.Exist(k.addr) {
+			if v != hashValue(types.EmptyCodeHash) {
 				return true
 			}
-		case balance:
-			if v != balanceValue(sdb.GetBalance(k.addr)) {
-				return true
-			}
-		case nonce:
-			if v != uintValue(sdb.GetNonce(k.addr)) {
-				return true
-			}
-		case code:
-			if !sdb.Exist(k.addr) {
-				if v != hashValue(types.EmptyCodeHash) {
-					return true
-				}
-			} else if v != hashValue(sdb.GetCodeHash(k.addr)) {
-				return true
-			}
-		case storage:
-			if v != hashValue(sdb.GetState(k.addr, k.slot)) {
-				return true
-			}
+		} else if v != hashValue(sdb.GetCodeHash(k.addr)) {
+			return true
+		}
+	case storage:
+		if v != hashValue(sdb.GetState(k.addr, k.slot)) {
+			return true
 		}
 	}
 	return false

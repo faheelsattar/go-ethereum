@@ -3,6 +3,8 @@ package parallel
 import (
 	"bytes"
 	"encoding/binary"
+	"maps"
+	"math/big"
 	"slices"
 	"sync"
 
@@ -131,6 +133,19 @@ type Result struct {
 	codes     map[common.Hash][]byte
 	preimages map[common.Hash][]byte
 	fee       *uint256.Int // coinbase credit, applied additively
+
+	deltas     map[common.Address]*big.Int     // balance changes applied additively
+	minBalance map[common.Address]*uint256.Int // balances required before the transaction
+}
+
+// holds reports whether the balance requirements of r hold on sdb.
+func (r *Result) holds(sdb *state.StateDB) (common.Address, bool) {
+	for addr, need := range r.minBalance {
+		if sdb.GetBalance(addr).Lt(need) {
+			return addr, false
+		}
+	}
+	return common.Address{}, true
 }
 
 // accountWrites groups the writes of one result that target one account.
@@ -204,6 +219,15 @@ func (r *Result) Apply(sdb *state.StateDB, coinbase common.Address, rules params
 	if r.fee != nil {
 		sdb.AddBalance(coinbase, r.fee, tracing.BalanceIncreaseRewardTransactionFee)
 	}
+	for _, addr := range slices.SortedFunc(maps.Keys(r.deltas), func(a, b common.Address) int { return bytes.Compare(a[:], b[:]) }) {
+		d := r.deltas[addr]
+		amount, _ := uint256.FromBig(new(big.Int).Abs(d))
+		if d.Sign() > 0 {
+			sdb.AddBalance(addr, amount, tracing.BalanceChangeUnspecified)
+		} else {
+			sdb.SubBalance(addr, amount, tracing.BalanceChangeUnspecified)
+		}
+	}
 	if r.Receipt != nil {
 		for _, l := range r.Receipt.Logs {
 			cp := *l
@@ -233,11 +257,17 @@ func (r *Result) fixAccessList(sdb *state.StateDB, coinbase common.Address) {
 		reIndex(acc.NonceChanges, index)
 		reIndex(acc.CodeChange, index)
 	}
-	if r.fee == nil {
-		return
+	// balances changed additively were recorded with the speculative value
+	fix := func(addr common.Address) {
+		if acc := r.AccessList.Accounts[addr]; acc != nil && len(acc.BalanceChanges) > 0 {
+			acc.BalanceChanges[index] = sdb.GetBalance(addr).Clone()
+		}
 	}
-	if acc := r.AccessList.Accounts[coinbase]; acc != nil && len(acc.BalanceChanges) > 0 {
-		acc.BalanceChanges[index] = sdb.GetBalance(coinbase).Clone()
+	if r.fee != nil {
+		fix(coinbase)
+	}
+	for addr := range r.deltas {
+		fix(addr)
 	}
 }
 
