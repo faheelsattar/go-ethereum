@@ -86,9 +86,24 @@ func (t *trackingStateDB) AddBalance(addr common.Address, amount *uint256.Int, r
 // account, which decides whether an empty account gets deleted.
 func (t *trackingStateDB) changeBalance(addr common.Address, amount *uint256.Int) {
 	if amount.IsZero() {
-		t.touchAll(addr)
+		// A zero change only touches the account, which matters only if the
+		// account may be empty (EIP-161): every zero-value call does this to
+		// its target.
+		t.touch(addr, exists, nonce, code)
+		if t.mayBeEmpty(addr) {
+			t.touchAll(addr)
+			t.write(addr, exists, balance)
+		}
+		return
 	}
 	t.write(addr, exists, balance)
+}
+
+// mayBeEmpty reports whether addr has neither a nonce nor code, so that its
+// balance decides whether it is empty.
+func (t *trackingStateDB) mayBeEmpty(addr common.Address) bool {
+	hash := t.StateDB.GetCodeHash(addr)
+	return t.StateDB.GetNonce(addr) == 0 && (hash == common.Hash{} || hash == types.EmptyCodeHash)
 }
 
 func (t *trackingStateDB) GetBalance(addr common.Address) *uint256.Int {
@@ -153,8 +168,13 @@ func (t *trackingStateDB) Exist(addr common.Address) bool {
 	return t.StateDB.Exist(addr)
 }
 
+// Empty reads the balance only if the account may be empty: one with code or
+// a nonce never is. Every value-carrying call asks this of its target.
 func (t *trackingStateDB) Empty(addr common.Address) bool {
-	t.touchAll(addr)
+	t.touch(addr, exists, nonce, code)
+	if t.mayBeEmpty(addr) {
+		t.touch(addr, balance)
+	}
 	return t.StateDB.Empty(addr)
 }
 
