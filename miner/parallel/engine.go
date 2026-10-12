@@ -25,26 +25,32 @@ type Config struct {
 
 // Stats counts what happened during a build.
 type Stats struct {
-	Planned    int
-	Executions int
-	Stale      int
-	Committed  int
-	Dropped    int
+	Planned      int
+	Chained      int // tasks that had to wait for an earlier one from the same sender
+	LongestChain int
+	Executions   int
+	Stale        int // results whose reads no longer held at commit time
+	Requeued     int // stale tasks handed back to the workers
+	Committed    int
+	Dropped      int
 
 	ExecutionTime time.Duration // time summed over all executions
+	ValidateTime  time.Duration // time the committer spent checking reads against the block state
 	CommitTime    time.Duration // time the committer spent applying results
 	WaitTime      time.Duration // time the committer spent waiting for results
+	ChainWaitTime time.Duration // the part of WaitTime spent with a chained task as the lowest one left
 }
 
 // Engine executes candidate transactions in parallel and commits them in
 // position order.
 type Engine struct {
-	store   *store
-	exec    *executor
-	workers int
-	next    int
-	dropped map[common.Address]bool
-	stats   Stats
+	store     *store
+	committed *store // writes of committed transactions, versioned by commit order
+	exec      *executor
+	workers   int
+	next      int
+	dropped   map[common.Address]bool
+	stats     Stats
 }
 
 // New returns an engine building on the parent state described by cfg.
@@ -53,18 +59,20 @@ func New(cfg Config) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := newStore()
+	s, committed := newStore(), newStore()
 	return &Engine{
-		store: s,
+		store:     s,
+		committed: committed,
 		exec: &executor{
-			chain:    cfg.Chain,
-			config:   cfg.Params,
-			db:       cfg.DB,
-			root:     cfg.Root,
-			header:   types.CopyHeader(cfg.Header),
-			coinbase: cfg.Coinbase,
-			store:    s,
-			parent:   parent,
+			chain:     cfg.Chain,
+			config:    cfg.Params,
+			db:        cfg.DB,
+			root:      cfg.Root,
+			header:    types.CopyHeader(cfg.Header),
+			coinbase:  cfg.Coinbase,
+			store:     s,
+			committed: committed,
+			parent:    parent,
 		},
 		workers: max(1, cfg.Workers),
 		dropped: make(map[common.Address]bool),
@@ -78,10 +86,14 @@ func (e *Engine) NewTask(lazy *txpool.LazyTransaction, sender common.Address, bl
 		Sender:   sender,
 		Lazy:     lazy,
 		Blob:     blob,
-		done:     make(chan struct{}),
 	}
 	e.next++
 	e.stats.Planned++
+	// resolving a blob transaction reconstructs its blobs, which takes
+	// milliseconds, so start right away instead of on the worker
+	if blob {
+		go t.resolve()
+	}
 	return t
 }
 
@@ -108,12 +120,22 @@ func (e *Engine) Seed(fn func(vm.StateDB) error) error {
 		return err
 	}
 	e.store.publish(-1, res.writes, res.codes)
+	e.committed.publish(-1, res.writes, res.codes)
 	return nil
 }
 
-// Run executes tasks and commits them into block in position order. It returns
-// true once block reports that it is full.
+// Run executes tasks and commits them into block as their results arrive. It
+// returns true once block reports that it is full.
 func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, error) {
+	chain := make(map[*Task]int, len(tasks))
+	for _, t := range tasks {
+		chain[t] = 1
+		if t.prev != nil {
+			chain[t] = chain[t.prev] + 1
+			e.stats.Chained++
+		}
+		e.stats.LongestChain = max(e.stats.LongestChain, chain[t])
+	}
 	sched := newScheduler(e.store, e.workers, e.exec.run)
 	sched.start(tasks)
 	defer func() {
@@ -123,12 +145,15 @@ func (e *Engine) Run(ctx context.Context, tasks []*Task, block Block) (bool, err
 	}()
 
 	c := &committer{
-		store:    e.store,
-		sched:    sched,
-		block:    block,
-		coinbase: e.exec.coinbase,
-		dropped:  e.dropped,
-		stats:    &e.stats,
+		store:     e.store,
+		committed: e.committed,
+		runOn:     e.exec.runOn,
+		requeue:   sched.push,
+		finished:  sched.finished,
+		block:     block,
+		coinbase:  e.exec.coinbase,
+		dropped:   e.dropped,
+		stats:     &e.stats,
 	}
 	return c.run(ctx, tasks)
 }

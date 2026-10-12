@@ -3,6 +3,7 @@ package parallel
 import (
 	"errors"
 	"fmt"
+	"math"
 	"runtime/debug"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -16,19 +17,41 @@ import (
 
 var errUnavailable = errors.New("transaction no longer available")
 
+// noVersions lies below every position, so a reader at it serves only its parent.
+const noVersions = math.MinInt
+
+// allVersions lies above every position, so a reader at it serves the newest versions.
+const allVersions = math.MaxInt
+
 // executor runs tasks against the state seen from their position.
 type executor struct {
-	chain    core.ChainContext
-	config   *params.ChainConfig
-	db       state.Database
-	root     common.Hash
-	header   *types.Header
-	coinbase common.Address
-	store    *store
-	parent   state.Reader
+	chain     core.ChainContext
+	config    *params.ChainConfig
+	db        state.Database
+	root      common.Hash
+	header    *types.Header
+	coinbase  common.Address
+	store     *store
+	committed *store
+	parent    state.Reader
 }
 
-func (e *executor) run(t *Task) (res *Result) {
+// run executes t on the parent state plus the versions below its position. A
+// requeued task was stale once already, so it runs on the committed writes
+// instead, which is the block state as of now.
+func (e *executor) run(t *Task) *Result {
+	if t.requeues > 0 {
+		return e.execute(t, newVersionedStateReader(allVersions, e.committed, e.parent))
+	}
+	return e.execute(t, newVersionedStateReader(t.Position, e.store, e.parent))
+}
+
+// runOn executes t on the block state alone, as a sequential builder would.
+func (e *executor) runOn(t *Task, sdb *state.StateDB) *Result {
+	return e.execute(t, newVersionedStateReader(noVersions, e.store, blockStateReader{sdb}))
+}
+
+func (e *executor) execute(t *Task, reader *versionedStateReader) (res *Result) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Error("parallel transaction execution panicked", "hash", t.Lazy.Hash, "position", t.Position, "err", r, "stack", string(debug.Stack()))
@@ -39,7 +62,6 @@ func (e *executor) run(t *Task) (res *Result) {
 	if tx == nil {
 		return &Result{Err: errUnavailable}
 	}
-	reader := newVersionedStateReader(t.Position, e.store, e.parent)
 	sdb, err := state.NewWithReader(e.root, e.db, reader)
 	if err != nil {
 		return &Result{Err: err}

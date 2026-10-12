@@ -259,10 +259,39 @@ func RecoverBlobs(cells []Cell, cellIndices []uint64) ([]Blob, error) {
 	if err := validateCellIndices(cells, cellIndices); err != nil {
 		return nil, err
 	}
+	if hasDataCells(cellIndices) {
+		return dataCellsToBlobs(cells, len(cellIndices)), nil
+	}
 	if useCKZG.Load() {
 		return ckzgRecoverBlobs(cells, cellIndices)
 	}
 	return gokzgRecoverBlobs(cells, cellIndices)
+}
+
+// hasDataCells reports whether cellIndices start with every data cell. The
+// extension is systematic, so those cells are the blob itself.
+func hasDataCells(cellIndices []uint64) bool {
+	if len(cellIndices) < DataPerBlob {
+		return false
+	}
+	for i, idx := range cellIndices[:DataPerBlob] {
+		if idx != uint64(i) {
+			return false
+		}
+	}
+	return true
+}
+
+// dataCellsToBlobs concatenates the data cells of each blob, given
+// cellsPerBlob cells per blob with the data cells first.
+func dataCellsToBlobs(cells []Cell, cellsPerBlob int) []Blob {
+	blobs := make([]Blob, len(cells)/cellsPerBlob)
+	for i := range blobs {
+		for j, cell := range cells[i*cellsPerBlob : i*cellsPerBlob+DataPerBlob] {
+			copy(blobs[i][j*len(cell):], cell[:])
+		}
+	}
+	return blobs
 }
 
 func validateCellIndices(cells []Cell, cellIndices []uint64) error {

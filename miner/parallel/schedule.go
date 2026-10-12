@@ -3,20 +3,23 @@ package parallel
 import (
 	"container/heap"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// scheduler hands tasks to a fixed set of workers, lowest position first.
+// scheduler hands tasks to a fixed set of workers, lowest position first, and
+// reports each finished task on finished.
 type scheduler struct {
-	store *store
-	run   func(*Task) *Result
+	store    *store
+	run      func(*Task) *Result
+	finished chan *Task
 
 	mu            sync.Mutex
 	cond          *sync.Cond
 	ready         taskHeap
 	closed        bool
-	executions    int
-	executionTime time.Duration
+	executions    atomic.Int64
+	executionTime atomic.Int64
 	wg            sync.WaitGroup
 }
 
@@ -35,6 +38,8 @@ func newScheduler(s *store, workers int, run func(*Task) *Result) *scheduler {
 
 // start releases every task that has no predecessor to wait for.
 func (s *scheduler) start(tasks []*Task) {
+	// every task finishes once, plus once per requeue
+	s.finished = make(chan *Task, len(tasks)*(1+maxRequeues))
 	for _, t := range tasks {
 		if t.prev == nil {
 			s.release(t)
@@ -54,17 +59,6 @@ func (s *scheduler) release(t *Task) {
 	}
 }
 
-// rerun discards the result of a task and pushed it back to the queue
-// for reexecution
-func (s *scheduler) rerun(t *Task, r *Result) {
-	t.mu.Lock()
-	s.store.unpublish(t.Position, r.writes)
-	t.result = nil
-	t.done = make(chan struct{})
-	t.mu.Unlock()
-	s.push(t)
-}
-
 // stop lets running executions finish and stops the workers.
 func (s *scheduler) stop() (int, time.Duration) {
 	s.mu.Lock()
@@ -73,7 +67,7 @@ func (s *scheduler) stop() (int, time.Duration) {
 	s.mu.Unlock()
 	s.cond.Broadcast()
 	s.wg.Wait()
-	return s.executions, s.executionTime
+	return int(s.executions.Load()), time.Duration(s.executionTime.Load())
 }
 
 func (s *scheduler) push(t *Task) {
@@ -108,28 +102,22 @@ func (s *scheduler) work() {
 		if t == nil {
 			return
 		}
-		var res *Result
-		if !t.isDropped() {
-			started := time.Now()
-			res = s.run(t)
-			s.mu.Lock()
-			s.executions++
-			s.executionTime += time.Since(started)
-			s.mu.Unlock()
-		}
+		started := time.Now()
+		res := s.run(t)
+		s.executions.Add(1)
+		s.executionTime.Add(int64(time.Since(started)))
 		s.finish(t, res)
 	}
 }
 
-// finish publishes the result of t and releases its same-sender successor.
+// finish publishes the result of t, reports it and releases the same-sender
+// successor of t.
 func (s *scheduler) finish(t *Task, res *Result) {
 	t.mu.Lock()
-	if res != nil && !t.dropped {
-		s.store.publish(t.Position, res.writes, res.codes)
-		t.result = res
-	}
-	close(t.done)
+	s.store.publish(t.Position, res.writes, res.codes)
+	t.result = res
 	t.mu.Unlock()
+	s.finished <- t
 	if t.next != nil {
 		s.release(t.next)
 	}

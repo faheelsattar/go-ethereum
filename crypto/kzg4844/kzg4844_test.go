@@ -406,6 +406,38 @@ func testRecoverBlob(t *testing.T, ckzg bool) {
 	}
 }
 
+func TestCKZGRecoverBlobFromDataCells(t *testing.T)  { testRecoverBlobFromDataCells(t, true) }
+func TestGoKZGRecoverBlobFromDataCells(t *testing.T) { testRecoverBlobFromDataCells(t, false) }
+
+// testRecoverBlobFromDataCells checks recovery when every data cell is present,
+// with and without the extension cells.
+func testRecoverBlobFromDataCells(t *testing.T, ckzg bool) {
+	defer switchBackend(t, ckzg)()
+
+	const blobCount = 3
+	d := newBlobs(t, blobCount)
+
+	for _, numCells := range []int{DataPerBlob, DataPerBlob + 1, CellsPerBlob} {
+		indices := make([]uint64, numCells)
+		for i := range indices {
+			indices[i] = uint64(i)
+		}
+		var partialCells []Cell
+		for bi := range blobCount {
+			for _, idx := range indices {
+				partialCells = append(partialCells, d.cells[bi*CellsPerBlob+int(idx)])
+			}
+		}
+		recovered, err := RecoverBlobs(partialCells, indices)
+		if err != nil {
+			t.Fatalf("%d cells: failed to recover blobs: %v", numCells, err)
+		}
+		if !slices.Equal(recovered, d.blobs) {
+			t.Fatalf("%d cells: recovered blobs do not match the originals", numCells)
+		}
+	}
+}
+
 func TestCKZGRecoverBlobWithInsufficientCells(t *testing.T) {
 	testRecoverBlobWithInsufficientCells(t, true)
 }

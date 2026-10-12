@@ -17,10 +17,12 @@
 package miner
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"math/big"
 	"reflect"
+	"slices"
 	"testing"
 	"time"
 
@@ -295,13 +297,28 @@ func TestParallelBuildPayloadMatchesSequential(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	have, want := parallelPayload.ResolveFull(), sequentialPayload.ResolveFull()
+	have, want := parallelPayload.ResolveFull().ExecutionPayload, sequentialPayload.ResolveFull().ExecutionPayload
 
-	if len(have.ExecutionPayload.Transactions) != wantTxs {
-		t.Fatalf("parallel payload has %d transactions, want %d", len(have.ExecutionPayload.Transactions), wantTxs)
+	if len(have.Transactions) != wantTxs {
+		t.Fatalf("parallel payload has %d transactions, want %d", len(have.Transactions), wantTxs)
 	}
-	if !reflect.DeepEqual(have, want) {
-		t.Fatalf("parallel payload differs from sequential payload:\n have %#v\n want %#v", have, want)
+	// The parallel builder commits results in the order they arrive, so the
+	// transactions may be ordered differently and the state roots differ in
+	// who paid for the first write to the counter slot. Compare the set and
+	// the gas, then check what the block left behind by importing it.
+	haveList, wantList := slices.Clone(have.Transactions), slices.Clone(want.Transactions)
+	slices.SortFunc(haveList, bytes.Compare)
+	slices.SortFunc(wantList, bytes.Compare)
+	if !reflect.DeepEqual(haveList, wantList) {
+		t.Fatalf("parallel payload has different transactions:\n have %x\n want %x", haveList, wantList)
+	}
+	if have.GasUsed != want.GasUsed {
+		t.Fatalf("parallel payload used %d gas, want %d", have.GasUsed, want.GasUsed)
+	}
+	statedb := importBlock(t, parallelBackend.chain, parallelPayload.full)
+	checkCounter(t, statedb, 2*len(testConflictKeys))
+	if slot := statedb.GetState(testContract, common.Hash{}); slot != common.BigToHash(common.Big1) {
+		t.Fatalf("log contract slot is %x, want 1", slot)
 	}
 }
 

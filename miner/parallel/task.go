@@ -2,7 +2,6 @@ package parallel
 
 import (
 	"bytes"
-	"context"
 	"encoding/binary"
 	"slices"
 	"sync"
@@ -86,11 +85,11 @@ type Task struct {
 	prev, next *Task // same sender neighbours; a scheduling hint only
 
 	mu       sync.Mutex
+	once     sync.Once
 	tx       *types.Transaction
 	result   *Result
-	done     chan struct{}
-	dropped  bool
 	released bool
+	requeues int // times the committer handed the task back as stale
 }
 
 // Follow records that t must not start before prev has executed once.
@@ -110,35 +109,13 @@ func (t *Task) Tx() *types.Transaction {
 }
 
 func (t *Task) resolve() *types.Transaction {
-	if tx := t.Tx(); tx != nil {
-		return tx
-	}
-	tx := t.Lazy.Resolve()
-	t.mu.Lock()
-	t.tx = tx
-	t.mu.Unlock()
-	return tx
-}
-
-func (t *Task) isDropped() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.dropped
-}
-
-// wait blocks until the current execution of t has finished
-func (t *Task) wait(ctx context.Context) (*Result, error) {
-	t.mu.Lock()
-	done := t.done
-	t.mu.Unlock()
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-done:
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.result, nil
+	t.once.Do(func() {
+		tx := t.Lazy.Resolve()
+		t.mu.Lock()
+		t.tx = tx
+		t.mu.Unlock()
+	})
+	return t.Tx()
 }
 
 // Result is the outcome of one execution of a Task.

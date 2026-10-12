@@ -1,9 +1,9 @@
 package parallel
 
 import (
+	"container/heap"
 	"context"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -24,9 +24,6 @@ const (
 	Full
 )
 
-// maxReruns bounds how often one task is re executed for stale reads.
-const maxReruns = 3
-
 // Block is the block under construction, as seen by the committer.
 type Block interface {
 	// State is the block state that committed results are applied to.
@@ -37,96 +34,161 @@ type Block interface {
 	Include(t *Task, r *Result) error
 }
 
-// committer goes through tasks in position order and commits each one as soon as
-// it has a result whose reads still hold against the block state.
+// maxRequeues bounds how often a stale task is handed back to the workers
+// before the committer executes it on the block state itself.
+const maxRequeues = 2
+
+// committer commits results as they arrive, lowest position first, without
+// waiting for the positions in between. The block order is the commit order.
 type committer struct {
-	store    *store
-	sched    *scheduler
-	block    Block
-	coinbase common.Address
-	dropped  map[common.Address]bool
-	stats    *Stats
+	store     *store
+	committed *store                              // writes of committed transactions, by commit order
+	runOn     func(*Task, *state.StateDB) *Result // executes a task on the block state
+	requeue   func(*Task)                         // hands a task back to the workers
+	finished  <-chan *Task
+	block     Block
+	coinbase  common.Address
+	dropped   map[common.Address]bool
+	stats     *Stats
 }
 
-// run commits tasks in order and reports whether the block became full.
-// it waits for each task to finish, and re executes it if its reads no longer hold.
-// note: in future maybe we can gain more speedup by not waiting for each task and
-// not caring about the order of transactions in the block TBD.
+// run commits every task once its result has arrived and reports whether the
+// block became full. It only waits while no finished task is left to commit.
 func (c *committer) run(ctx context.Context, tasks []*Task) (bool, error) {
-	for _, t := range tasks {
-		if c.dropped[t.Sender] {
-			c.drop(t)
-			continue
-		}
-		started := time.Now()
-		result, err := t.wait(ctx)
-		c.stats.WaitTime += time.Since(started)
-		if err != nil {
-			return false, err
-		}
-		verdict, err := c.block.Check(t)
-		if err != nil {
-			return false, err
-		}
-		switch verdict {
-		case Full:
-			return true, nil
-		case Reject:
-			c.reject(t)
-			continue
-		}
-		if result, err = c.settle(ctx, t, result); err != nil {
-			return false, err
-		}
-		if result.Err != nil {
-			if errors.Is(result.Err, core.ErrNonceTooLow) {
-				c.drop(t)
-			} else {
-				c.reject(t)
+	var (
+		ready   taskHeap
+		handled = make(map[*Task]bool, len(tasks))
+		parked  = make(map[*Task]*Task) // successors waiting for their same-sender predecessor
+		lowest  = 0                     // index of the lowest task not handled yet
+	)
+	for len(handled) < len(tasks) {
+		if len(ready) == 0 {
+			started := time.Now()
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case t := <-c.finished:
+				heap.Push(&ready, t)
 			}
+			waited := time.Since(started)
+			c.stats.WaitTime += waited
+			for handled[tasks[lowest]] {
+				lowest++
+			}
+			if tasks[lowest].prev != nil {
+				c.stats.ChainWaitTime += waited
+			}
+		}
+		for more := true; more; {
+			select {
+			case t := <-c.finished:
+				heap.Push(&ready, t)
+			default:
+				more = false
+			}
+		}
+		t := heap.Pop(&ready).(*Task)
+		// a requeued predecessor must commit first, or the nonce is off
+		if t.prev != nil && !handled[t.prev] {
+			parked[t.prev] = t
 			continue
 		}
-		started = time.Now()
-		err = c.block.Include(t, result)
-		c.stats.CommitTime += time.Since(started)
-		if err != nil {
-			c.reject(t)
-			continue
+		done, full, err := c.commit(t)
+		if full || err != nil {
+			return full, err
 		}
-		// tx was included so we can publish the coibase balance
-		// to the store.
-		c.publishCoinbase(t.Position)
-		c.stats.Committed++
+		if !done {
+			continue // requeued, it comes back on finished
+		}
+		handled[t] = true
+		if next, ok := parked[t]; ok {
+			delete(parked, t)
+			heap.Push(&ready, next)
+		}
 	}
 	return false, nil
 }
 
-// settle reexecutes t until its results reads hold against the block state.
-func (c *committer) settle(ctx context.Context, t *Task, r *Result) (*Result, error) {
-	reruns := 0
-	for {
-		if r == nil {
-			return nil, errors.New("task dropped while committing")
-		}
-		if !stale(c.block.State(), r.reads) {
-			return r, nil
-		}
-		if reruns == maxReruns {
-			return nil, fmt.Errorf("task %d still stale after %d reexecutions", t.Position, reruns)
-		}
-		// since the result is stale we need to discard it and reexecute
-		// by pushing it back to the scheduler.
-		c.stats.Stale++
-		c.sched.rerun(t, r)
-		var err error
-		started := time.Now()
-		r, err = t.wait(ctx)
-		c.stats.WaitTime += time.Since(started)
-		if err != nil {
-			return nil, err
-		}
-		reruns++
+// commit checks t against the block and includes it. A stale result is
+// handed back to the workers, in which case t is not done yet.
+func (c *committer) commit(t *Task) (done bool, full bool, err error) {
+	if c.dropped[t.Sender] {
+		c.drop(t)
+		return true, false, nil
 	}
+	verdict, err := c.block.Check(t)
+	if err != nil {
+		return false, false, err
+	}
+	switch verdict {
+	case Full:
+		return false, true, nil
+	case Reject:
+		c.reject(t)
+		return true, false, nil
+	}
+	t.mu.Lock()
+	r := t.result
+	t.mu.Unlock()
+	started := time.Now()
+	fresh := !stale(c.block.State(), r.reads)
+	c.stats.ValidateTime += time.Since(started)
+	if !fresh {
+		c.stats.Stale++
+		if t.requeues < maxRequeues {
+			c.retract(t, r)
+			t.requeues++
+			c.stats.Requeued++
+			c.requeue(t)
+			return false, false, nil
+		}
+		started = time.Now()
+		r = c.rerun(t, r)
+		c.stats.WaitTime += time.Since(started)
+	}
+	if r.Err != nil {
+		if errors.Is(r.Err, core.ErrNonceTooLow) {
+			c.drop(t)
+		} else {
+			c.reject(t)
+		}
+		return true, false, nil
+	}
+	started = time.Now()
+	err = c.block.Include(t, r)
+	c.stats.CommitTime += time.Since(started)
+	if err != nil {
+		c.reject(t)
+		return true, false, nil
+	}
+	c.publishCommitted(t.Position, r)
+	c.stats.Committed++
+	return true, false, nil
+}
+
+// retract removes the published writes of the stale result r of t.
+func (c *committer) retract(t *Task, r *Result) {
+	t.mu.Lock()
+	c.store.unpublish(t.Position, r.writes)
+	t.result = nil
+	t.mu.Unlock()
+}
+
+// rerun replaces the result r of t by one computed on the block state, which
+// cannot be stale, and publishes its writes for the positions above.
+func (c *committer) rerun(t *Task, r *Result) *Result {
+	c.retract(t, r)
+
+	started := time.Now()
+	r = c.runOn(t, c.block.State())
+	c.stats.Executions++
+	c.stats.ExecutionTime += time.Since(started)
+
+	t.mu.Lock()
+	c.store.publish(t.Position, r.writes, r.codes)
+	t.result = r
+	t.mu.Unlock()
+	return r
 }
 
 func (c *committer) reject(t *Task) {
@@ -136,7 +198,6 @@ func (c *committer) reject(t *Task) {
 
 func (c *committer) drop(t *Task) {
 	t.mu.Lock()
-	t.dropped = true
 	if t.result != nil {
 		c.store.unpublish(t.Position, t.result.writes)
 		t.result = nil
@@ -145,14 +206,20 @@ func (c *committer) drop(t *Task) {
 	c.stats.Dropped++
 }
 
-// publishCoinbase records the coinbase after a commit. Fees are applied as
+// publishCommitted records the writes of the result r committed for the task
+// at pos, in commit order, and the coinbase after it. Fees are applied as
 // deltas, so this is where its true balance becomes visible to later tasks.
-func (c *committer) publishCoinbase(pos int) {
+func (c *committer) publishCommitted(pos int, r *Result) {
 	sdb := c.block.State()
-	c.store.publish(pos, map[key]value{
+	coinbase := map[key]value{
 		{addr: c.coinbase, field: exists}:  boolValue(sdb.Exist(c.coinbase)),
 		{addr: c.coinbase, field: balance}: balanceValue(sdb.GetBalance(c.coinbase)),
-	}, nil)
+	}
+	c.store.publish(pos, coinbase, nil)
+
+	seq := c.stats.Committed
+	c.committed.publish(seq, r.writes, r.codes)
+	c.committed.publish(seq, coinbase, nil)
 }
 
 // stale reports whether any recorded read differs from the current state.
