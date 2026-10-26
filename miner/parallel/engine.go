@@ -27,6 +27,10 @@ type Config struct {
 	// Reader, if set, reads the parent state instead of DB.Reader(Root), such
 	// as a SharedReader the block state also reads through.
 	Reader state.Reader
+	// JumpDests and Precompiles, if set, are the chain's caches of code
+	// analysis and precompile results, which the sequential builder uses too.
+	JumpDests   vm.JumpDestCache
+	Precompiles *vm.PrecompileCache
 }
 
 // Stats counts what happened during a build.
@@ -85,22 +89,27 @@ func New(cfg Config) (*Engine, error) {
 			return nil, err
 		}
 	}
+	// a sequential build reuses one EVM and its code analysis
+	jumpDests := cfg.JumpDests
+	if jumpDests == nil {
+		jumpDests = core.NewJumpDestCache()
+	}
 	s, committed := newStore(), newStore()
 	return &Engine{
 		store:     s,
 		committed: committed,
 		exec: &executor{
-			chain:     cfg.Chain,
-			config:    cfg.Params,
-			db:        cfg.DB,
-			root:      cfg.Root,
-			header:    types.CopyHeader(cfg.Header),
-			coinbase:  cfg.Coinbase,
-			store:     s,
-			committed: committed,
-			parent:    parent,
-			// a sequential build reuses one EVM and its code analysis
-			jumpDests: core.NewJumpDestCache(),
+			chain:       cfg.Chain,
+			config:      cfg.Params,
+			db:          cfg.DB,
+			root:        cfg.Root,
+			header:      types.CopyHeader(cfg.Header),
+			coinbase:    cfg.Coinbase,
+			store:       s,
+			committed:   committed,
+			parent:      parent,
+			jumpDests:   jumpDests,
+			precompiles: cfg.Precompiles,
 		},
 		workers: max(1, cfg.Workers),
 		dropped: make(map[common.Address]bool),

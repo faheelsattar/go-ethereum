@@ -619,6 +619,11 @@ var (
 		Value:    uint(ethconfig.Defaults.Miner.ParallelWorkers),
 		Category: flags.MinerCategory,
 	}
+	MinerParallelSharedReadsFlag = &cli.BoolFlag{
+		Name:     "miner.parallel-shared-reads",
+		Usage:    "Share the parent state reads of parallel executions with the block state",
+		Category: flags.MinerCategory,
+	}
 	MinerParallelBenchmarkModeFlag = &cli.StringFlag{
 		Name:     "miner.parallel-benchmark-mode",
 		Usage:    "Parallel execution benchmark mode: off or alternate",
@@ -1766,6 +1771,9 @@ func setMiner(ctx *cli.Context, cfg *miner.Config) {
 	}
 	if ctx.IsSet(MinerParallelWorkersFlag.Name) {
 		cfg.ParallelWorkers = int(ctx.Uint(MinerParallelWorkersFlag.Name))
+	}
+	if ctx.IsSet(MinerParallelSharedReadsFlag.Name) {
+		cfg.ParallelSharedReads = ctx.Bool(MinerParallelSharedReadsFlag.Name)
 	}
 	if ctx.IsSet(MinerParallelBenchmarkModeFlag.Name) {
 		cfg.ParallelBenchmarkMode = ctx.String(MinerParallelBenchmarkModeFlag.Name)

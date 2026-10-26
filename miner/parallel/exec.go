@@ -36,6 +36,8 @@ type executor struct {
 	committed *store
 	parent    state.Reader
 	jumpDests vm.JumpDestCache // code analysis shared by the executions, as one EVM would
+
+	precompiles *vm.PrecompileCache // the chain's precompile results, if set
 }
 
 // run executes t on the parent state plus the versions below its position. A
@@ -75,6 +77,9 @@ func (e *executor) execute(t *Task, reader *versionedStateReader) (res *Result) 
 	defer evm.Release()
 	if e.jumpDests != nil {
 		evm.SetJumpDestCache(e.jumpDests)
+	}
+	if e.precompiles != nil {
+		evm.SetPrecompileCache(e.precompiles)
 	}
 
 	gas := core.NewGasPool(e.header.GasLimit)

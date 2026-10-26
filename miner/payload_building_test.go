@@ -335,10 +335,16 @@ func TestParallelBuildPayloadMatchesSequential(t *testing.T) {
 }
 
 func TestParallelBuildPayloadConflicts(t *testing.T) {
+	t.Run("own-reads", func(t *testing.T) { testParallelBuildPayloadConflicts(t, false) })
+	t.Run("shared-reads", func(t *testing.T) { testParallelBuildPayloadConflicts(t, true) })
+}
+
+func testParallelBuildPayloadConflicts(t *testing.T, sharedReads bool) {
 	db := rawdb.NewMemoryDatabase()
 	w, b := newTestWorker(t, params.MergedTestChainConfig, beacon.New(ethash.NewFaker()), db, 0)
 	w.config.ParallelExecution = true
 	w.config.ParallelWorkers = 8
+	w.config.ParallelSharedReads = sharedReads
 
 	txs := counterCalls(types.LatestSigner(params.MergedTestChainConfig), testConflictKeys, 2)
 	if errs := b.txPool.Add(txs, true); errs != nil {

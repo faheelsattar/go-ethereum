@@ -210,19 +210,24 @@ func (c *committer) drop(t *Task) {
 }
 
 // publishCommitted records the writes of the result r committed for the task
-// at pos, in commit order, and the coinbase after it. Fees are applied as
-// deltas, so this is where its true balance becomes visible to later tasks.
+// at pos, in commit order, and the coinbase after it. Fees and other balance
+// deltas are applied additively, so this is where the true balances become
+// visible to later tasks.
 func (c *committer) publishCommitted(pos int, r *Result) {
 	sdb := c.block.State()
-	coinbase := map[key]value{
+	balances := map[key]value{
 		{addr: c.coinbase, field: exists}:  boolValue(sdb.Exist(c.coinbase)),
 		{addr: c.coinbase, field: balance}: balanceValue(sdb.GetBalance(c.coinbase)),
 	}
-	c.store.publish(pos, coinbase, nil)
+	for addr := range r.deltas {
+		balances[key{addr: addr, field: exists}] = boolValue(sdb.Exist(addr))
+		balances[key{addr: addr, field: balance}] = balanceValue(sdb.GetBalance(addr))
+	}
+	c.store.publish(pos, balances, nil)
 
 	seq := c.stats.Committed
 	c.committed.publish(seq, r.writes, r.codes)
-	c.committed.publish(seq, coinbase, nil)
+	c.committed.publish(seq, balances, nil)
 }
 
 // resultStale returns a read of r that no longer holds on sdb, if any,

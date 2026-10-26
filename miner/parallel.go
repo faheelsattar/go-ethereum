@@ -86,6 +86,9 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 		Header:   env.header,
 		Coinbase: env.coinbase,
 		Reader:   parallelReader(env),
+
+		JumpDests:   miner.chain.JumpDestCache(),
+		Precompiles: miner.chain.PrecompileCache(),
 	})
 	if err != nil {
 		return err

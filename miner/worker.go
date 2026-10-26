@@ -174,7 +174,7 @@ func (miner *Miner) generateWorkWithBenchmark(ctx context.Context, genParam *gen
 			spanEnd(nil)
 		}
 	}()
-	work, err := miner.prepareWork(ctx, genParam, witness)
+	work, err := miner.prepareWork(ctx, genParam, witness, miner.buildsInParallel(benchmark))
 	if err != nil {
 		return &newPayloadResult{err: err}
 	}
@@ -284,7 +284,7 @@ func (miner *Miner) generateWorkWithBenchmark(ctx context.Context, genParam *gen
 // prepareWork constructs the sealing task according to the given parameters,
 // either based on the last chain head or specified parent. In this function
 // the pending transactions are not filled yet, only the empty task returned.
-func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, witness bool) (result *environment, err error) {
+func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, witness bool, parallelBuild bool) (result *environment, err error) {
 	_, _, spanEnd := telemetry.StartSpan(ctx, "miner.prepareWork")
 	defer spanEnd(&err)
 	miner.confMu.RLock()
@@ -367,7 +367,7 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 	// Could potentially happen if starting to mine in an odd state.
 	// Note genParams.coinbase can be different with header.Coinbase
 	// since clique algorithm can modify the coinbase field in header.
-	env, err := miner.makeEnv(parent, header, genParams.coinbase, witness)
+	env, err := miner.makeEnv(parent, header, genParams.coinbase, witness, parallelBuild)
 	if err != nil {
 		log.Error("Failed to create sealing context", "err", err)
 		return nil, err
@@ -378,14 +378,14 @@ func (miner *Miner) prepareWork(ctx context.Context, genParams *generateParams, 
 }
 
 // makeEnv creates a new environment for the sealing block.
-func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address, witness bool) (*environment, error) {
+func (miner *Miner) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address, witness bool, parallelBuild bool) (*environment, error) {
 	// Retrieve the parent state to execute on top.
 	state, err := miner.chain.StateAtForkBoundary(parent, header)
 	if err != nil {
 		return nil, err
 	}
 	var shared *parallel.SharedReader
-	if miner.config.ParallelExecution && miner.config.ParallelSharedReads &&
+	if parallelBuild && miner.config.ParallelSharedReads &&
 		!miner.chainConfig.IsUBT(parent.Number, parent.Time) && !miner.chainConfig.IsUBT(header.Number, header.Time) {
 		// the parallel engine's executions and the block state share their
 		// parent reads
@@ -491,12 +491,17 @@ func (miner *Miner) applyTransaction(ctx context.Context, env *environment, tx *
 	return receipt, bal, nil
 }
 
-func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
-	parallel := miner.config.ParallelExecution
-	if env.benchmark != nil && env.benchmark.mode == parallelBenchmarkAlternate {
-		parallel = env.benchmark.parallel()
+// buildsInParallel reports whether a build commits its transactions with the
+// parallel engine, which the benchmark decides when it alternates.
+func (miner *Miner) buildsInParallel(benchmark *buildBenchmarkAttempt) bool {
+	if benchmark != nil && benchmark.mode == parallelBenchmarkAlternate {
+		return benchmark.parallel()
 	}
-	if parallel {
+	return miner.config.ParallelExecution
+}
+
+func (miner *Miner) commitTransactions(ctx context.Context, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce, interrupt *atomic.Int32) error {
+	if miner.buildsInParallel(env.benchmark) {
 		if supported, reason := parallelExecutionSupported(env); supported {
 			return miner.commitTransactionsParallel(ctx, env, plainTxs, blobTxs, interrupt)
 		} else {

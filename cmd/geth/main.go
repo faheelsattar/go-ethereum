@@ -117,6 +117,7 @@ var (
 		utils.MinerMaxBlobsFlag,
 		utils.MinerParallelExecutionFlag,
 		utils.MinerParallelWorkersFlag,
+		utils.MinerParallelSharedReadsFlag,
 		utils.MinerParallelBenchmarkModeFlag,
 		utils.MinerParallelBenchmarkOutputFlag,
 		utils.MinerParallelBenchmarkNoBlobsFlag,
