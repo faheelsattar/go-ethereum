@@ -1,6 +1,7 @@
 package parallel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -73,7 +74,7 @@ func (e *executor) execute(t *Task, reader *versionedStateReader) (res *Result) 
 	gas := core.NewGasPool(e.header.GasLimit)
 	before := gas.Snapshot()
 	sdb.SetTxContext(tx.Hash(), t.Position, uint32(t.Position+1))
-	receipt, accessList, err := core.ApplyTransaction(evm, gas, sdb, e.header, tx)
+	receipt, accessList, err := core.ApplyTransaction(context.Background(), evm, gas, sdb, e.header, tx)
 	if err != nil {
 		reads, readErr := trackedStateDB.reads()
 		if readErr != nil {

@@ -118,13 +118,19 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 			"executionTime", metrics.ExecutionTime, "validateTime", metrics.ValidateTime, "commitTime", metrics.CommitTime,
 			"waitTime", metrics.WaitTime, "chainWaitTime", metrics.ChainWaitTime)
 	}()
+	// EIP-2780 lowers the smallest gas limit a transaction may carry.
+	isAmsterdam := miner.chainConfig.IsAmsterdam(env.header.Number, env.header.Time)
+	minTxGas := params.TxGas
+	if isAmsterdam {
+		minTxGas = params.TxBaseCost2780
+	}
 	for {
 		if interrupt != nil {
 			if signal := interrupt.Load(); signal != commitInterruptNone {
 				return signalToErr(signal)
 			}
 		}
-		if env.gasPool.Gas() < params.TxGas {
+		if env.gasPool.Available(isAmsterdam) < minTxGas {
 			return nil
 		}
 		if !blobTxs.Empty() && env.blobs >= miner.maxBlobsPerBlock(env.header.Time) {
@@ -146,7 +152,7 @@ func (miner *Miner) commitTransactionsParallel(ctx context.Context, env *environ
 // price order, popping senders the engine has dropped.
 func (miner *Miner) planParallel(engine *parallel.Engine, env *environment, plainTxs, blobTxs *txorder.TransactionsByPriceAndNonce) []*parallel.Task {
 	var (
-		budget      = env.gasPool.Gas() * parallelPlanningGasFactor
+		budget      = env.gasPool.Available(miner.chainConfig.IsAmsterdam(env.header.Number, env.header.Time)) * parallelPlanningGasFactor
 		blobGas     uint64
 		planned     uint64
 		plannedBlob uint64
@@ -211,7 +217,7 @@ func (b *parallelBlock) Check(t *parallel.Task) (parallel.Verdict, error) {
 	switch {
 	case tx == nil:
 		return parallel.Reject, nil
-	case env.gasPool.Gas() < t.Lazy.Gas:
+	case env.gasPool.Available(b.miner.chainConfig.IsAmsterdam(env.header.Number, env.header.Time)) < t.Lazy.Gas:
 		return parallel.Reject, nil
 	case tx.Protected() && !b.miner.chainConfig.IsEIP155(env.header.Number):
 		return parallel.Reject, nil
@@ -235,7 +241,7 @@ func (b *parallelBlock) Include(t *parallel.Task, r *parallel.Result) error {
 		return err
 	}
 	env.state.SetTxContext(tx.Hash(), env.tcount, uint32(env.tcount+1))
-	r.Apply(env.state, env.coinbase)
+	r.Apply(env.state, env.coinbase, env.evm.GetRules())
 
 	receipt, blockHash := r.Receipt, env.header.Hash()
 	receipt.CumulativeGasUsed = env.gasPool.CumulativeUsed()

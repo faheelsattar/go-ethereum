@@ -141,7 +141,7 @@ func importBlock(t *testing.T, chain *core.BlockChain, block *types.Block) *stat
 	if _, err := chain.InsertChain(types.Blocks{block}); err != nil {
 		t.Fatalf("failed to insert parallel-built block: %v", err)
 	}
-	statedb, err := chain.StateAt(block.Header())
+	statedb, err := chain.StateAt(block.Root(), block.Number(), block.Time())
 	if err != nil {
 		t.Fatalf("failed to open state: %v", err)
 	}
@@ -168,6 +168,18 @@ func newTestWorkerBackend(t *testing.T, chainConfig *params.ChainConfig, engine 
 	}
 	for _, key := range testConflictKeys {
 		gspec.Alloc[crypto.PubkeyToAddress(key.PublicKey)] = types.Account{Balance: new(big.Int).Set(testBankFunds)}
+	}
+	if chainConfig.IsPrague(common.Big0, 0) {
+		// the block's system calls need their contracts
+		gspec.Alloc[params.BeaconRootsAddress] = types.Account{Nonce: 1, Code: params.BeaconRootsCode}
+		gspec.Alloc[params.HistoryStorageAddress] = types.Account{Nonce: 1, Code: params.HistoryStorageCode}
+		gspec.Alloc[params.WithdrawalQueueAddress] = types.Account{Nonce: 1, Code: params.WithdrawalQueueCode}
+		gspec.Alloc[params.ConsolidationQueueAddress] = types.Account{Nonce: 1, Code: params.ConsolidationQueueCode}
+	}
+	if chainConfig.IsAmsterdam(common.Big0, 0) {
+		// EIP-8282's builder requests
+		gspec.Alloc[params.BuilderDepositAddress] = types.Account{Nonce: 1, Code: params.BuilderDepositCode}
+		gspec.Alloc[params.BuilderExitAddress] = types.Account{Nonce: 1, Code: params.BuilderExitCode}
 	}
 	switch e := engine.(type) {
 	case *clique.Clique:

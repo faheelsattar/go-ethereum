@@ -13,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/holiman/uint256"
 )
 
@@ -141,9 +142,9 @@ type accountWrites struct {
 	slots   map[common.Hash]common.Hash
 }
 
-// Apply writes the result into sdb and finalises the transaction. The caller
-// must have set the transaction context on sdb.
-func (r *Result) Apply(sdb *state.StateDB, coinbase common.Address) {
+// Apply writes the result into sdb and finalises the transaction under rules.
+// The caller must have set the transaction context on sdb.
+func (r *Result) Apply(sdb *state.StateDB, coinbase common.Address, rules params.Rules) {
 	byAddr := make(map[common.Address]*accountWrites)
 	for k, v := range r.writes {
 		w := byAddr[k.addr]
@@ -212,7 +213,7 @@ func (r *Result) Apply(sdb *state.StateDB, coinbase common.Address) {
 	for h, p := range r.preimages {
 		sdb.AddPreimage(h, p)
 	}
-	sdb.Finalise(true)
+	sdb.Finalise(rules)
 	r.fixAccessList(sdb, coinbase)
 }
 
